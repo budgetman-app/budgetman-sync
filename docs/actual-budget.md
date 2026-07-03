@@ -58,6 +58,20 @@ pending row in place when it later settles (matched on the FX-stable
 `originalAmount + originalCurrency` key) rather than importing a duplicate. Both
 default to `false`, so leaving them unset preserves the default behavior.
 
+### Isracard pending
+
+The standard Isracard scraper only returns settled charges. When `keepPending`
+is on, budgetman additionally fetches the "not yet settled" (approvals) charges
+from Isracard's web app (`web.isracard.co.il`) using the already-authenticated
+session, so pending FX charges surface immediately with their
+`originalAmount`/`originalCurrency`. This is best-effort — if it fails, the
+settled import is unaffected. Two caveats:
+
+- If you run with a strict domain firewall (`security.blockByDefault: true`),
+  allow `web.isracard.co.il` in addition to the usual scraper domains.
+- The Isracard **site password must be 8–20 characters, letters and digits only**
+  (the scraper's login API rejects symbols, even though the website accepts them).
+
 ## Troubleshooting
 
 - **`out-of-sync-migrations` error** — The budget database and the `@actual-app/api` version are out of sync. Ensure your Actual Budget server and moneyman's `@actual-app/api` dependency use compatible versions. Update both to their latest releases, or pin them to matching versions. See [actualbudget/actual#3656](https://github.com/actualbudget/actual/issues/3656) for context.
