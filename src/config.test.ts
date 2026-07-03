@@ -141,6 +141,41 @@ describe("config", () => {
     },
   );
 
+  describe("actual.keepPending / actual.upsert (opt-in, default-off)", () => {
+    const baseActual = {
+      serverUrl: "https://actual-budget:5006",
+      password: "test-password",
+      budgetId: "test-budget-id",
+      accounts: {},
+    };
+
+    it("defaults keepPending and upsert to false", () => {
+      const parsed = MoneymanConfigSchema.parse({
+        storage: { actual: { ...baseActual } },
+      });
+      expect(parsed.storage.actual?.keepPending).toBe(false);
+      expect(parsed.storage.actual?.upsert).toBe(false);
+    });
+
+    it("accepts explicit keepPending and upsert values", () => {
+      const parsed = MoneymanConfigSchema.parse({
+        storage: {
+          actual: { ...baseActual, keepPending: true, upsert: true },
+        },
+      });
+      expect(parsed.storage.actual?.keepPending).toBe(true);
+      expect(parsed.storage.actual?.upsert).toBe(true);
+    });
+
+    it("rejects a non-boolean keepPending", () => {
+      expect(() =>
+        MoneymanConfigSchema.parse({
+          storage: { actual: { ...baseActual, keepPending: "yes" } },
+        }),
+      ).toThrow();
+    });
+  });
+
   it.each(internalUrls)(
     "should support internal URL %s for webPost.url",
     async (url) => {

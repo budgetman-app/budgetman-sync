@@ -48,6 +48,12 @@ export const ActualSchema = z.object({
   password: z.string().min(1, { error: "Actual Budget password is required" }),
   budgetId: z.string().min(1, { error: "Actual Budget ID is required" }),
   accounts: z.record(z.string(), z.string()),
+  // Opt-in, default-off additions (budgetman). Keep upstream behavior unchanged.
+  // keepPending: import pending scraper transactions (as uncleared) instead of
+  // skipping them. upsert: match pending->settled on the FX-stable
+  // originalAmount+originalCurrency key and update the row in place.
+  keepPending: z.boolean().default(false),
+  upsert: z.boolean().default(false),
 });
 
 export const WebPostSchema = z.object({

@@ -23,6 +23,19 @@ storage: {
      * A key-value list to correlate each account with the Actual Budget account ID
      */
     accounts: Record<string, string>;
+    /**
+     * (budgetman, opt-in, default false) Import pending scraper transactions
+     * instead of skipping them. Pending rows are added as uncleared
+     * (`cleared: false`) so they reduce the envelope immediately.
+     */
+    keepPending?: boolean;
+    /**
+     * (budgetman, opt-in, default false) Match a pending charge to its settled
+     * twin on the FX-stable `originalAmount + originalCurrency` key and update
+     * the existing row in place (amount + cleared) instead of adding a
+     * duplicate. Never overwrites the transaction's category.
+     */
+    upsert?: boolean;
   };
 };
 ```
@@ -39,7 +52,11 @@ Example:
 }
 ```
 
-**Note:** Pending transactions will be skipped during import.
+**Note:** Pending transactions are skipped during import by default. Set
+`keepPending: true` to import them as uncleared, and `upsert: true` to update a
+pending row in place when it later settles (matched on the FX-stable
+`originalAmount + originalCurrency` key) rather than importing a duplicate. Both
+default to `false`, so leaving them unset preserves the default behavior.
 
 ## Troubleshooting
 
