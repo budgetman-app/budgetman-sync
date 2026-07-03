@@ -11,6 +11,12 @@ import { TransactionRow, TransactionStorage } from "../../types.js";
 import { createLogger } from "../../utils/logger.js";
 import { formatUnknownError } from "../../utils/utils.js";
 import { createSaveStats, SaveStats } from "../saveStats.js";
+import {
+  computeStableKey,
+  planActualUpsert,
+  type ExistingActualTx,
+  type IncomingTx,
+} from "./actualUpsert.js";
 
 const logger = createLogger("ActualBudgetStorage");
 
@@ -37,6 +43,12 @@ export class ActualBudgetStorage implements TransactionStorage {
     );
 
     try {
+      if (this.config.storage.actual?.upsert) {
+        await this.upsertTransactions(txns, stats, onProgress);
+        return stats;
+      }
+
+      const keepPending = Boolean(this.config.storage.actual?.keepPending);
       const transactionsByActualAccountId = new Map<
         string,
         ImportTransactionEntity[]
@@ -44,7 +56,7 @@ export class ActualBudgetStorage implements TransactionStorage {
 
       for (let tx of txns) {
         const isPending = tx.status === TransactionStatuses.Pending;
-        if (isPending) {
+        if (isPending && !keepPending) {
           continue;
         }
 
@@ -206,12 +218,120 @@ export class ActualBudgetStorage implements TransactionStorage {
       amount,
       payee_name: tx.description,
       cleared: tx.status === TransactionStatuses.Completed,
-      imported_id: hash(
-        this.config.options.scraping.transactionHashType === "moneyman"
-          ? tx.uniqueId
-          : tx.hash,
-      ).toString(),
+      imported_id: this.settledImportedId(tx),
       notes: tx.memo,
     };
+  }
+
+  // The imported_id used once a transaction has settled — moneyman's existing
+  // uniqueId/voucher-based hash, so upsert-imported rows stay idempotent with any
+  // rows imported via the standard path.
+  private settledImportedId(tx: TransactionRow): string {
+    return hash(
+      this.config.options.scraping.transactionHashType === "moneyman"
+        ? tx.uniqueId
+        : tx.hash,
+    ).toString();
+  }
+
+  private toIncoming(tx: TransactionRow): IncomingTx {
+    return {
+      baseKey: computeStableKey({
+        date: new Date(tx.date).toISOString().split("T")[0],
+        originalAmount: tx.originalAmount,
+        originalCurrency: tx.originalCurrency,
+        description: tx.description,
+        account: tx.account,
+      }),
+      settledImportedId: this.settledImportedId(tx),
+      isPending: tx.status === TransactionStatuses.Pending,
+      amount: actualApi.utils.amountToInteger(tx.chargedAmount),
+      date: new Date(tx.date).toISOString().split("T")[0],
+      payeeName: tx.description,
+      notes: tx.memo ?? "",
+    };
+  }
+
+  /**
+   * budgetman upsert path (opt-in via `actual.upsert`): match pending->settled on
+   * the FX-stable key and update in place instead of duplicating. Pending rows are
+   * included only when `keepPending` is also on. Category is never modified.
+   */
+  private async upsertTransactions(
+    txns: Array<TransactionRow>,
+    stats: SaveStats,
+    onProgress: (status: string) => Promise<void>,
+  ) {
+    const keepPending = Boolean(this.config.storage.actual?.keepPending);
+
+    const rowsByAccountId = new Map<string, TransactionRow[]>();
+    for (const tx of txns) {
+      if (tx.status === TransactionStatuses.Pending && !keepPending) continue;
+      const actualAccountId = this.bankToActualAccountMap.get(tx.account);
+      if (!actualAccountId) {
+        stats.otherSkipped++;
+        continue;
+      }
+      const list = rowsByAccountId.get(actualAccountId) ?? [];
+      list.push(tx);
+      rowsByAccountId.set(actualAccountId, list);
+    }
+
+    for (const [actualAccountId, rows] of rowsByAccountId) {
+      const accountName =
+        this.accountIdToNameMap.get(actualAccountId) || actualAccountId;
+
+      const incoming = rows.map((tx) => this.toIncoming(tx));
+      const dates = incoming.map((i) => i.date).sort();
+      // Widen the lookup window so a settled charge can still find its earlier
+      // pending twin.
+      const start = new Date(dates[0]);
+      start.setDate(start.getDate() - 7);
+      const startDate = start.toISOString().split("T")[0];
+      const endDate = new Date().toISOString().split("T")[0];
+
+      const existingRows = await actualApi.getTransactions(
+        actualAccountId,
+        startDate,
+        endDate,
+      );
+      const existing: ExistingActualTx[] = existingRows.map((e) => ({
+        id: e.id,
+        imported_id: e.imported_id ?? null,
+        amount: e.amount,
+        cleared: Boolean(e.cleared),
+        notes: e.notes ?? null,
+      }));
+
+      const plan = planActualUpsert(incoming, existing);
+      logger(
+        `[${accountName}] upsert plan: ${plan.adds.length} add, ${plan.updates.length} update`,
+      );
+      for (const line of plan.report) logger(`[${accountName}] ${line}`);
+      await onProgress(`Upserting transactions for account "${accountName}"`);
+
+      if (plan.adds.length > 0) {
+        // Use importTransactions for adds so Actual's payee/category rules run.
+        const resp = await actualApi
+          .importTransactions(
+            actualAccountId,
+            plan.adds.map((a) => ({ ...a, account: actualAccountId })),
+          )
+          .catch((error) => {
+            logger(`[${accountName}] error adding: ${error.message}`);
+            return { errors: [error.message], added: [], updated: [] };
+          });
+        stats.added += resp.added?.length ?? 0;
+      }
+
+      for (const u of plan.updates) {
+        await actualApi.updateTransaction(u.id, u.fields);
+      }
+      stats.existing += plan.updates.length;
+    }
+
+    if (this.config.options.scraping.transactionHashType !== "moneyman") {
+      logger("Warning: transactionHashType should be set to 'moneyman'");
+    }
   }
 }
