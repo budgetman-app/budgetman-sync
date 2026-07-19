@@ -153,21 +153,29 @@ async function scrapeAccount(
 }
 
 /**
- * budgetman (opt-in via `actual.keepPending`): the standard Isracard scraper
- * omits pending charges. When enabled, fetch them from the new web app using the
- * still-authenticated session and merge them into the scrape result so pending
- * FX charges (with originalAmount/originalCurrency) surface immediately. Best
- * effort — never fails the scrape.
+ * budgetman (opt-in via `scraping.includePendingCharges`): the standard Isracard
+ * scraper omits pending charges. When enabled, fetch them from the new web app
+ * using the still-authenticated session and merge them into the scrape result so
+ * pending FX charges (with originalAmount/originalCurrency) surface immediately.
+ * Best effort — never fails the scrape.
+ *
+ * `actual.keepPending` is still honoured so existing configs keep working, but it
+ * only governs what the Actual storage does with pending rows; whether they are
+ * fetched at all is a scraping decision.
  */
 async function mergeIsracardPending(
   account: AccountConfig,
   result: Awaited<ReturnType<typeof getAccountTransactions>>,
   browserContext?: BrowserContext,
 ): Promise<void> {
+  const wantPending =
+    config.options.scraping.includePendingCharges ||
+    Boolean(config.storage.actual?.keepPending);
+
   if (
     !result.success ||
     account.companyId !== CompanyTypes.isracard ||
-    !config.storage.actual?.keepPending ||
+    !wantPending ||
     !browserContext
   ) {
     return;

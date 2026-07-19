@@ -174,6 +174,7 @@ describe("GoogleSheetsStorage", () => {
           scraping: {
             daysBack: 10,
             futureMonths: 1,
+            includePendingCharges: false,
             transactionHashType: "",
             additionalTransactionInfo: false,
             includeRawTransaction: false,

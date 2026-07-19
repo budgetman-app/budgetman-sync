@@ -197,6 +197,24 @@ describe("config", () => {
       ]);
     });
 
+    it("defaults scraping.includePendingCharges to false", () => {
+      const parsed = MoneymanConfigSchema.parse({
+        storage: { actual: { ...baseActual } },
+      });
+      expect(parsed.options.scraping.includePendingCharges).toBe(false);
+    });
+
+    it("accepts scraping.includePendingCharges independently of any storage", () => {
+      // The point of the flag: fetching pending must be testable with localJson
+      // alone, without configuring Actual at all.
+      const parsed = MoneymanConfigSchema.parse({
+        storage: { localJson: { enabled: true } },
+        options: { scraping: { includePendingCharges: true } },
+      });
+      expect(parsed.options.scraping.includePendingCharges).toBe(true);
+      expect(parsed.storage.actual).toBeUndefined();
+    });
+
     it("rejects an invalid regular expression at config time", () => {
       // Better to fail loudly on load than to throw mid-scrape.
       expect(() =>

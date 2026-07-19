@@ -141,6 +141,11 @@ export const ScrapingOptionsSchema = z.object({
   accountsToScrape: z.array(z.string()).optional(),
   daysBack: z.number().min(1).max(365).default(10),
   futureMonths: z.number().min(0).max(12).default(1),
+  // (budgetman, opt-in, default false) Fetch charges the provider has authorised
+  // but not yet settled. This is a SCRAPING concern, so it lives here rather than
+  // under a storage provider — a run can then be validated with localJson before
+  // anything is written to a real ledger.
+  includePendingCharges: z.boolean().default(false),
   transactionHashType: z.enum(["", "moneyman"]).default(""),
   additionalTransactionInfo: z.boolean().default(false),
   includeRawTransaction: z.boolean().default(false),

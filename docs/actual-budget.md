@@ -67,7 +67,13 @@ default to `false`, so leaving them unset preserves the default behavior.
 
 ### Isracard pending
 
-The standard Isracard scraper only returns settled charges. When `keepPending`
+Fetching pending charges is controlled by **`options.scraping.includePendingCharges`**,
+not by this storage provider — so a run can be validated with `localJson` before
+anything is written to a real ledger. `storage.actual.keepPending` still enables
+it too (existing configs keep working), but it properly governs only what the
+Actual provider _does_ with pending rows once they exist.
+
+The standard Isracard scraper only returns settled charges. When pending fetching
 is on, budgetman additionally fetches the "not yet settled" (approvals) charges
 from Isracard's web app (`web.isracard.co.il`) using the already-authenticated
 session, so pending FX charges surface immediately with their
