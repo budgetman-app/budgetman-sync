@@ -36,6 +36,13 @@ storage: {
      * duplicate. Never overwrites the transaction's category.
      */
     upsert?: boolean;
+    /**
+     * (budgetman, opt-in, default `[]`) Case-insensitive regular expressions.
+     * A transaction whose description matches any of them is dropped before
+     * import. Use this when a card and the checking account it settles against
+     * both map to the same Actual account.
+     */
+    excludeDescriptions?: string[];
   };
 };
 ```
@@ -71,6 +78,32 @@ settled import is unaffected. Two caveats:
   allow `web.isracard.co.il` in addition to the usual scraper domains.
 - The Isracard **site password must be 8–20 characters, letters and digits only**
   (the scraper's login API rejects symbols, even though the website accepts them).
+
+### Avoiding double-counted card spend
+
+If you map both a credit card and the checking account it settles against to the
+**same** Actual account, you will import the same spending twice: once as the
+card's individual purchases, and again as the bank's aggregate settlement line
+for the whole bill. `excludeDescriptions` drops the aggregate line so the
+granular card rows remain the single source of truth:
+
+```jsonc
+"actual": {
+  // ...
+  "excludeDescriptions": ["אושר-ישרא"]
+}
+```
+
+Patterns are case-insensitive JavaScript regular expressions matched against the
+transaction description, and an invalid one fails at config load rather than
+mid-scrape. Prefer a **substring pattern over an exact string** — banks truncate
+long descriptions, so the same line can appear in more than one form (e.g.
+`דירקט אושר-ישראכרט` and `דירקט מטח אושר-ישרא`).
+
+Validate your patterns against real data before relying on them: run a scrape
+with the `localJson` storage (or check the log lines reading
+`excluded "<description>" ... — matched /<pattern>/`) and confirm that exactly
+the aggregate lines, and nothing else, are being dropped.
 
 ## Troubleshooting
 

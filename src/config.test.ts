@@ -141,7 +141,7 @@ describe("config", () => {
     },
   );
 
-  describe("actual.keepPending / actual.upsert (opt-in, default-off)", () => {
+  describe("actual budgetman additions (opt-in, default-off)", () => {
     const baseActual = {
       serverUrl: "https://actual-budget:5006",
       password: "test-password",
@@ -171,6 +171,39 @@ describe("config", () => {
       expect(() =>
         MoneymanConfigSchema.parse({
           storage: { actual: { ...baseActual, keepPending: "yes" } },
+        }),
+      ).toThrow();
+    });
+
+    it("defaults excludeDescriptions to an empty list", () => {
+      const parsed = MoneymanConfigSchema.parse({
+        storage: { actual: { ...baseActual } },
+      });
+      expect(parsed.storage.actual?.excludeDescriptions).toEqual([]);
+    });
+
+    it("accepts a list of regular expressions", () => {
+      const parsed = MoneymanConfigSchema.parse({
+        storage: {
+          actual: {
+            ...baseActual,
+            excludeDescriptions: ["אושר-ישרא", "^visa settlement$"],
+          },
+        },
+      });
+      expect(parsed.storage.actual?.excludeDescriptions).toEqual([
+        "אושר-ישרא",
+        "^visa settlement$",
+      ]);
+    });
+
+    it("rejects an invalid regular expression at config time", () => {
+      // Better to fail loudly on load than to throw mid-scrape.
+      expect(() =>
+        MoneymanConfigSchema.parse({
+          storage: {
+            actual: { ...baseActual, excludeDescriptions: ["([unclosed"] },
+          },
         }),
       ).toThrow();
     });

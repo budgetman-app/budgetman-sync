@@ -54,6 +54,26 @@ export const ActualSchema = z.object({
   // originalAmount+originalCurrency key and update the row in place.
   keepPending: z.boolean().default(false),
   upsert: z.boolean().default(false),
+  // excludeDescriptions: case-insensitive regular expressions; a transaction
+  // whose description matches any of them is dropped before import. Needed when
+  // a card and the checking account it settles against both map to the same
+  // Actual account — the bank's aggregate card-settlement lines would otherwise
+  // double-count the card's own per-purchase rows. Empty (the default) is a no-op.
+  excludeDescriptions: z
+    .array(z.string().min(1))
+    .default([])
+    .refine(
+      (patterns) =>
+        patterns.every((p) => {
+          try {
+            new RegExp(p, "i");
+            return true;
+          } catch {
+            return false;
+          }
+        }),
+      { error: "excludeDescriptions must contain valid regular expressions" },
+    ),
 });
 
 export const WebPostSchema = z.object({

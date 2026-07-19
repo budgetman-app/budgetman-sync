@@ -60,7 +60,7 @@ import { ActualBudgetStorage } from "./actual.js";
 const storeOf = () => (actualApi as any).__store() as any[];
 const resetStore = () => (actualApi as any).__reset();
 
-function makeConfig(): MoneymanConfig {
+function makeConfig(actualOver: Record<string, unknown> = {}): MoneymanConfig {
   return {
     storage: {
       actual: {
@@ -70,6 +70,8 @@ function makeConfig(): MoneymanConfig {
         accounts: { "0041": "act-1" },
         keepPending: true,
         upsert: true,
+        excludeDescriptions: [],
+        ...actualOver,
       },
     },
     options: { scraping: { transactionHashType: "moneyman" } },
@@ -102,8 +104,11 @@ function row(over: Partial<TransactionRow>): TransactionRow {
   } as TransactionRow;
 }
 
-async function save(txns: TransactionRow[]) {
-  const storage = new ActualBudgetStorage(makeConfig());
+async function save(
+  txns: TransactionRow[],
+  actualOver: Record<string, unknown> = {},
+) {
+  const storage = new ActualBudgetStorage(makeConfig(actualOver));
   return storage.saveTransactions(txns, async () => {});
 }
 
@@ -186,5 +191,79 @@ describe("ActualBudgetStorage upsert (pending -> settled)", () => {
     expect(rows[0].cleared).toBe(true);
     expect(rows[0].notes).toBe("settled ₪130.00→₪130.00");
     expect(rows[0].category).toBe("cat-food");
+  });
+});
+
+describe("ActualBudgetStorage excludeDescriptions", () => {
+  beforeEach(() => resetStore());
+
+  // The real case this exists for: the card posts every purchase individually
+  // while the checking account posts one aggregate settlement line for the whole
+  // bill. Both map to the same Actual account under the chosen model, so without
+  // the exclusion every card purchase is counted twice.
+  const AGGREGATE = "דירקט אושר-ישראכרט";
+  // The bank truncates long descriptions, so the same line also appears shortened —
+  // which is why the config takes a regex rather than an exact string.
+  const AGGREGATE_TRUNCATED = "דירקט מטח אושר-ישרא";
+
+  it("drops matching rows, keeps the rest, and counts them as skipped", async () => {
+    const stats = await save(
+      [
+        row({ description: "UPSTASH", uniqueId: "u1" }),
+        row({ description: AGGREGATE, chargedAmount: -4210.5, uniqueId: "u2" }),
+        row({ description: "טורטיה בר חולון", uniqueId: "u3" }),
+      ],
+      { excludeDescriptions: ["אושר-ישרא"] },
+    );
+
+    expect(storeOf().map((r) => r.payee_name)).toEqual([
+      "UPSTASH",
+      "טורטיה בר חולון",
+    ]);
+    expect(stats.otherSkipped).toBe(1);
+  });
+
+  it("one pattern covers the truncated variant the bank also posts", async () => {
+    await save(
+      [
+        row({ description: AGGREGATE, uniqueId: "u1" }),
+        row({ description: AGGREGATE_TRUNCATED, uniqueId: "u2" }),
+      ],
+      { excludeDescriptions: ["אושר-ישרא"] },
+    );
+    expect(storeOf()).toHaveLength(0);
+  });
+
+  it("is a no-op when empty (the default)", async () => {
+    await save([row({ description: AGGREGATE, uniqueId: "u1" })], {
+      excludeDescriptions: [],
+    });
+    expect(storeOf()).toHaveLength(1);
+  });
+
+  it("applies on the standard non-upsert path too", async () => {
+    const stats = await save(
+      [
+        row({ description: AGGREGATE, uniqueId: "u1" }),
+        row({ description: "UPSTASH", uniqueId: "u2" }),
+      ],
+      { upsert: false, excludeDescriptions: ["אושר-ישרא"] },
+    );
+    expect(storeOf().map((r) => r.payee_name)).toEqual(["UPSTASH"]);
+    expect(stats.otherSkipped).toBe(1);
+  });
+
+  it("matches case-insensitively and honors anchors", async () => {
+    await save(
+      [
+        row({ description: "VISA SETTLEMENT", uniqueId: "u1" }),
+        row({ description: "visa settlement", uniqueId: "u2" }),
+        row({ description: "NOT A VISA SETTLEMENT SUFFIX", uniqueId: "u3" }),
+      ],
+      { excludeDescriptions: ["^visa settlement$"] },
+    );
+    expect(storeOf().map((r) => r.payee_name)).toEqual([
+      "NOT A VISA SETTLEMENT SUFFIX",
+    ]);
   });
 });

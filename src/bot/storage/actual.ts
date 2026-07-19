@@ -23,6 +23,7 @@ const logger = createLogger("ActualBudgetStorage");
 export class ActualBudgetStorage implements TransactionStorage {
   private bankToActualAccountMap = new Map<string, string>();
   private accountIdToNameMap = new Map<string, string>();
+  private excludeRes?: RegExp[];
 
   constructor(private config: MoneymanConfig) {}
 
@@ -43,8 +44,10 @@ export class ActualBudgetStorage implements TransactionStorage {
     );
 
     try {
+      const kept = this.applyDescriptionExclusions(txns, stats);
+
       if (this.config.storage.actual?.upsert) {
-        await this.upsertTransactions(txns, stats, onProgress);
+        await this.upsertTransactions(kept, stats, onProgress);
         return stats;
       }
 
@@ -54,7 +57,7 @@ export class ActualBudgetStorage implements TransactionStorage {
         ImportTransactionEntity[]
       >();
 
-      for (let tx of txns) {
+      for (let tx of kept) {
         const isPending = tx.status === TransactionStatuses.Pending;
         if (isPending && !keepPending) {
           continue;
@@ -204,6 +207,53 @@ export class ActualBudgetStorage implements TransactionStorage {
         `Failed to initialize Actual Budget: ${formatUnknownError(error)}`,
       );
     }
+  }
+
+  private excludePatterns(): RegExp[] {
+    if (!this.excludeRes) {
+      this.excludeRes = (
+        this.config.storage.actual?.excludeDescriptions ?? []
+      ).map((p) => new RegExp(p, "i"));
+    }
+    return this.excludeRes;
+  }
+
+  /**
+   * Drop transactions whose description matches `actual.excludeDescriptions`
+   * (opt-in; empty by default, in which case this is a no-op).
+   *
+   * Needed when a card and the checking account it settles against both map to
+   * the same Actual account. The bank posts an aggregate settlement line for the
+   * whole card bill, which would double-count the card's own per-purchase rows.
+   * Excluding it by description keeps the granular rows as the single source.
+   */
+  private applyDescriptionExclusions(
+    txns: Array<TransactionRow>,
+    stats: SaveStats,
+  ): Array<TransactionRow> {
+    const patterns = this.excludePatterns();
+    if (patterns.length === 0) {
+      return txns;
+    }
+
+    const kept: TransactionRow[] = [];
+    for (const tx of txns) {
+      const matched = patterns.find((re) => re.test(tx.description));
+      if (matched) {
+        logger(
+          `excluded "${tx.description}" (${tx.chargedAmount}) — matched /${matched.source}/`,
+        );
+        stats.otherSkipped++;
+        continue;
+      }
+      kept.push(tx);
+    }
+
+    const excluded = txns.length - kept.length;
+    if (excluded > 0) {
+      logger(`excluded ${excluded} transaction(s) by description`);
+    }
+    return kept;
   }
 
   private convertTransactionToActualFormat(
