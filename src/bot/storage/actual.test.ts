@@ -267,3 +267,121 @@ describe("ActualBudgetStorage excludeDescriptions", () => {
     ]);
   });
 });
+
+describe("ActualBudgetStorage card-pending reconciliation (domestic, cross-source)", () => {
+  beforeEach(() => resetStore());
+
+  const cfg = {
+    // Both the checking scrape (477872) and the card (0041) map to one Actual
+    // account, as in the real config — that shared bucket is where the two
+    // views of a card charge meet and reconcile.
+    accounts: { "0041": "act-1", "477872": "act-1" },
+    excludeDescriptions: ["מטח אושר-ישרא", "ישראכרט בע"],
+    cardPendingDescriptions: ["אושר-ישראכרט"],
+  };
+
+  // FIBI per-purchase authorization: domestic, no merchant, from the checking scrape.
+  const authorization = (over: Partial<TransactionRow> = {}) =>
+    row({
+      account: "477872",
+      companyId: "beinleumi" as TransactionRow["companyId"],
+      description: "דירקט אושר-ישראכרט",
+      originalAmount: -169.9,
+      originalCurrency: "ILS",
+      chargedAmount: -169.9,
+      status: TransactionStatuses.Pending,
+      uniqueId: "fibi-auth",
+      ...over,
+    });
+  // Isracard granular settled purchase for the same 169.90, a day later.
+  const granular = (over: Partial<TransactionRow> = {}) =>
+    row({
+      account: "0041",
+      companyId: "isracard" as TransactionRow["companyId"],
+      description: "UPAPP",
+      originalAmount: -169.9,
+      originalCurrency: "ILS",
+      chargedAmount: -169.9,
+      status: TransactionStatuses.Completed,
+      identifier: "V-UPAPP",
+      uniqueId: "isracard-upapp",
+      ...over,
+    });
+
+  it("imports the FIBI authorization as pending instead of excluding it", async () => {
+    await save([authorization()], cfg);
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false);
+    expect(rows[0].payee_name).toBe("דירקט אושר-ישראכרט");
+    expect(rows[0].amount).toBe(-16990);
+  });
+
+  it("still excludes the FX hold and the settlement debit", async () => {
+    const stats = await save(
+      [
+        authorization({ uniqueId: "a1" }),
+        row({
+          description: "דירקט מטח אושר-ישרא",
+          chargedAmount: -3.39,
+          uniqueId: "fx",
+        }),
+        row({
+          description: '0041 - ישראכרט בע"מ',
+          chargedAmount: -50,
+          uniqueId: "settle",
+        }),
+      ],
+      cfg,
+    );
+    expect(storeOf().map((r) => r.payee_name)).toEqual(["דירקט אושר-ישראכרט"]);
+    expect(stats.otherSkipped).toBe(2);
+  });
+
+  it("settles the granular onto the authorization: one row, cleared, category kept", async () => {
+    await save([authorization()], cfg);
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    rows[0].category = "cat-living"; // human categorizes the pending placeholder
+
+    await save([granular()], cfg);
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // no duplicate
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].amount).toBe(-16990);
+    expect(rows[0].category).toBe("cat-living"); // preserved across the supersede
+  });
+
+  it("does not double-count when authorization and granular arrive together", async () => {
+    await save([authorization()], cfg); // placeholder exists
+    await save([authorization(), granular()], cfg); // both in the next scrape
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+  });
+
+  it("leaves the FX pending path untouched (non-ILS keeps the stable key)", async () => {
+    // A foreign charge from Isracard must still reconcile on originalAmount, not
+    // on the domestic card key — settlement moves chargedAmount but not the twin.
+    await save(
+      [row({ description: "UPSTASH", uniqueId: "fx-p" })], // USD pending, from the default row()
+      cfg,
+    );
+    expect(storeOf()).toHaveLength(1);
+    await save(
+      [
+        row({
+          description: "UPSTASH",
+          status: TransactionStatuses.Completed,
+          chargedAmount: -59.2,
+          identifier: "V",
+          uniqueId: "fx-s",
+        }),
+      ],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1); // reconciled, not duplicated
+    expect(rows[0].amount).toBe(-5920);
+  });
+});

@@ -225,6 +225,31 @@ describe("config", () => {
         }),
       ).toThrow();
     });
+
+    it("defaults cardPendingDescriptions to an empty list", () => {
+      const parsed = MoneymanConfigSchema.parse({
+        storage: { actual: { ...baseActual } },
+      });
+      expect(parsed.storage.actual?.cardPendingDescriptions).toEqual([]);
+    });
+
+    it("accepts card-pending patterns and rejects invalid ones", () => {
+      const parsed = MoneymanConfigSchema.parse({
+        storage: {
+          actual: { ...baseActual, cardPendingDescriptions: ["אושר-ישראכרט"] },
+        },
+      });
+      expect(parsed.storage.actual?.cardPendingDescriptions).toEqual([
+        "אושר-ישראכרט",
+      ]);
+      expect(() =>
+        MoneymanConfigSchema.parse({
+          storage: {
+            actual: { ...baseActual, cardPendingDescriptions: ["(bad"] },
+          },
+        }),
+      ).toThrow();
+    });
   });
 
   it.each(internalUrls)(

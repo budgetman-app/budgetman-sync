@@ -74,6 +74,30 @@ export const ActualSchema = z.object({
         }),
       { error: "excludeDescriptions must contain valid regular expressions" },
     ),
+  // cardPendingDescriptions: case-insensitive regexes identifying the bank's
+  // per-purchase card PENDING authorizations (e.g. FIBI "אושר-ישראכרט"). When
+  // set, matching rows are NOT excluded — they are imported as pending
+  // placeholders and reconciled in place with the card issuer's settled granular
+  // row (matched on the domestic amount + purchase date), so a recent card
+  // charge is visible immediately and never double-counted when it settles.
+  // Requires upsert. Empty (the default) leaves behavior unchanged.
+  cardPendingDescriptions: z
+    .array(z.string().min(1))
+    .default([])
+    .refine(
+      (patterns) =>
+        patterns.every((p) => {
+          try {
+            new RegExp(p, "i");
+            return true;
+          } catch {
+            return false;
+          }
+        }),
+      {
+        error: "cardPendingDescriptions must contain valid regular expressions",
+      },
+    ),
 });
 
 export const WebPostSchema = z.object({

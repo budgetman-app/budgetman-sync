@@ -1,6 +1,7 @@
 import * as actualApi from "@actual-app/api";
 import type { ImportTransactionEntity } from "@actual-app/core/@types/src/types/models/index.js";
 import { hash } from "hash-it";
+import { CompanyTypes } from "israeli-bank-scrapers";
 import { TransactionStatuses } from "israeli-bank-scrapers/lib/transactions.js";
 import assert from "node:assert";
 import fs from "node:fs/promises";
@@ -12,6 +13,7 @@ import { createLogger } from "../../utils/logger.js";
 import { formatUnknownError } from "../../utils/utils.js";
 import { createSaveStats, SaveStats } from "../saveStats.js";
 import {
+  computeCardKey,
   computeStableKey,
   planActualUpsert,
   type ExistingActualTx,
@@ -24,6 +26,7 @@ export class ActualBudgetStorage implements TransactionStorage {
   private bankToActualAccountMap = new Map<string, string>();
   private accountIdToNameMap = new Map<string, string>();
   private excludeRes?: RegExp[];
+  private cardPendingRes?: RegExp[];
 
   constructor(private config: MoneymanConfig) {}
 
@@ -238,6 +241,12 @@ export class ActualBudgetStorage implements TransactionStorage {
 
     const kept: TransactionRow[] = [];
     for (const tx of txns) {
+      // A card-pending authorization we intend to reconcile is never dropped,
+      // even if an excludeDescriptions pattern would also match it.
+      if (this.cardPendingPatterns().some((re) => re.test(tx.description))) {
+        kept.push(tx);
+        continue;
+      }
       const matched = patterns.find((re) => re.test(tx.description));
       if (matched) {
         logger(
@@ -284,19 +293,52 @@ export class ActualBudgetStorage implements TransactionStorage {
     ).toString();
   }
 
+  private cardPendingPatterns(): RegExp[] {
+    if (!this.cardPendingRes) {
+      this.cardPendingRes = (
+        this.config.storage.actual?.cardPendingDescriptions ?? []
+      ).map((p) => new RegExp(p, "i"));
+    }
+    return this.cardPendingRes;
+  }
+
+  /**
+   * A domestic (ILS) card charge has two views that must reconcile: the bank's
+   * per-purchase pending authorization (description matches a configured
+   * pattern) and the card issuer's settled granular row (companyId isracard).
+   * They share only amount + date, so they take the card key rather than the FX
+   * stable key. FX charges (non-ILS) are excluded — their reconciliation depends
+   * on the original-currency key, which must not change.
+   */
+  private isDomesticCardCharge(tx: TransactionRow): boolean {
+    const patterns = this.cardPendingPatterns();
+    if (patterns.length === 0) return false;
+    const domestic = !tx.originalCurrency || tx.originalCurrency === "ILS";
+    if (!domestic) return false;
+    return (
+      patterns.some((re) => re.test(tx.description)) ||
+      tx.companyId === CompanyTypes.isracard
+    );
+  }
+
   private toIncoming(tx: TransactionRow): IncomingTx {
+    const date = new Date(tx.date).toISOString().split("T")[0];
+    const amount = actualApi.utils.amountToInteger(tx.chargedAmount);
+    const baseKey = this.isDomesticCardCharge(tx)
+      ? computeCardKey({ date, amountMinor: amount })
+      : computeStableKey({
+          date,
+          originalAmount: tx.originalAmount,
+          originalCurrency: tx.originalCurrency,
+          description: tx.description,
+          account: tx.account,
+        });
     return {
-      baseKey: computeStableKey({
-        date: new Date(tx.date).toISOString().split("T")[0],
-        originalAmount: tx.originalAmount,
-        originalCurrency: tx.originalCurrency,
-        description: tx.description,
-        account: tx.account,
-      }),
+      baseKey,
       settledImportedId: this.settledImportedId(tx),
       isPending: tx.status === TransactionStatuses.Pending,
-      amount: actualApi.utils.amountToInteger(tx.chargedAmount),
-      date: new Date(tx.date).toISOString().split("T")[0],
+      amount,
+      date,
       payeeName: tx.description,
       notes: tx.memo ?? "",
     };

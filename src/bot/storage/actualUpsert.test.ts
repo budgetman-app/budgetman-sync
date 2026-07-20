@@ -1,4 +1,5 @@
 import {
+  computeCardKey,
   computeStableKey,
   planActualUpsert,
   PENDING_NOTE,
@@ -184,5 +185,144 @@ describe("planActualUpsert", () => {
       "s1",
       "s2",
     ]);
+  });
+});
+
+describe("computeCardKey", () => {
+  it("matches a bank pending authorization to the card issuer's settled row", () => {
+    // Same domestic amount + purchase date, different descriptions/accounts.
+    const auth = computeCardKey({ date: "2026-07-19", amountMinor: -16990 });
+    const settledRow = computeCardKey({
+      date: "2026-07-19",
+      amountMinor: -16990,
+    });
+    expect(auth).toBe(settledRow);
+    expect(auth.startsWith("pend:")).toBe(true); // reuses the base-key/slot machinery
+  });
+
+  it("is sign-insensitive but distinguishes amount and date", () => {
+    const k = computeCardKey({ date: "2026-07-19", amountMinor: -16990 });
+    expect(computeCardKey({ date: "2026-07-19", amountMinor: 16990 })).toBe(k);
+    expect(
+      computeCardKey({ date: "2026-07-19", amountMinor: -16991 }),
+    ).not.toBe(k);
+    expect(
+      computeCardKey({ date: "2026-07-20", amountMinor: -16990 }),
+    ).not.toBe(k);
+  });
+});
+
+describe("card pending -> settled reconciliation (domestic, cross-source)", () => {
+  const CARD = computeCardKey({ date: "2026-07-19", amountMinor: -16990 });
+  const auth = (over: Partial<IncomingTx> = {}): IncomingTx => ({
+    baseKey: CARD,
+    settledImportedId: "auth-hash", // never used for a pending row
+    isPending: true,
+    amount: -16990,
+    date: "2026-07-19",
+    payeeName: "דירקט אושר-ישראכרט",
+    notes: "",
+    ...over,
+  });
+  const granular = (over: Partial<IncomingTx> = {}): IncomingTx => ({
+    ...auth(),
+    isPending: false,
+    settledImportedId: "isracard-hash",
+    payeeName: "UPAPP",
+    ...over,
+  });
+
+  it("day 1 — authorization alone imports as a persistent pending placeholder", () => {
+    const { adds, updates } = planActualUpsert([auth()], []);
+    expect(updates).toHaveLength(0);
+    expect(adds).toHaveLength(1);
+    expect(adds[0]).toMatchObject({
+      imported_id: CARD,
+      amount: -16990,
+      cleared: false,
+      notes: PENDING_NOTE,
+      payee_name: "דירקט אושר-ישראכרט",
+    });
+  });
+
+  it("re-scraping the still-pending authorization changes nothing", () => {
+    const existing: ExistingActualTx[] = [
+      {
+        id: "p",
+        imported_id: CARD,
+        amount: -16990,
+        cleared: false,
+        notes: PENDING_NOTE,
+      },
+    ];
+    const plan = planActualUpsert([auth()], existing);
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.updates).toHaveLength(0);
+  });
+
+  it("later day — settled granular supersedes the placeholder in place, category intact", () => {
+    const existing: ExistingActualTx[] = [
+      {
+        id: "p",
+        imported_id: CARD,
+        amount: -16990,
+        cleared: false,
+        notes: PENDING_NOTE,
+      },
+    ];
+    const plan = planActualUpsert([granular()], existing);
+    expect(plan.adds).toHaveLength(0); // no duplicate
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0]).toMatchObject({
+      id: "p",
+      fields: { cleared: true, imported_id: "isracard-hash", amount: -16990 },
+    });
+    // category is never in the update fields
+    expect("category" in plan.updates[0].fields).toBe(false);
+  });
+
+  it("SAME batch — authorization + settled both present: settled wins, no duplicate", () => {
+    // The critical case: once the charge settles, the bank pending authorization
+    // is still in the same scrape. Without same-batch dedup the pending would
+    // re-add a placeholder alongside the settled row.
+    const existing: ExistingActualTx[] = [
+      {
+        id: "p",
+        imported_id: CARD,
+        amount: -16990,
+        cleared: false,
+        notes: PENDING_NOTE,
+      },
+    ];
+    const plan = planActualUpsert([auth(), granular()], existing);
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].fields.imported_id).toBe("isracard-hash");
+  });
+
+  it("same-batch authorization + settled with NO prior placeholder: one settled row only", () => {
+    const plan = planActualUpsert([auth(), granular()], []);
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.adds).toHaveLength(1);
+    expect(plan.adds[0]).toMatchObject({
+      imported_id: "isracard-hash",
+      cleared: true,
+      payee_name: "UPAPP",
+    });
+  });
+
+  it("idempotent once settled: re-scraping the granular is a no-op", () => {
+    const existing: ExistingActualTx[] = [
+      {
+        id: "p",
+        imported_id: "isracard-hash",
+        amount: -16990,
+        cleared: true,
+        notes: "",
+      },
+    ];
+    const plan = planActualUpsert([granular()], existing);
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.updates).toHaveLength(0);
   });
 });
