@@ -107,3 +107,77 @@ drill-down (scaffolded here) or, if a future capture proves the Isracard
 - Source of the charge date: FIBI drill-down (Option A) is chosen. If a clean
   Isracard `מחוץ למועד` capture is preferred (single source, Option B), the
   provider needs no change — only the enrichment that fills `processedDate`.
+
+---
+
+## Increment 2 — enrichment + wiring (2026-08-02)
+
+### A-vs-B RESOLVED: HYBRID (live-validated)
+
+The live DigitalV3 capture proved **B is out**: `GetTransactionsList` gives merchant
+NAME + PENDING (`approvals`) + FX + an `isdirectDebit` flag, but **every settled row
+carries only `purchaseDate`** — no bank-charge-date field. So the charge date must
+come from **FIBI's SUGBAKA=211 settlement drill-down (Option A)**. Build =
+**Isracard (names + pending + FX, uncleared side) + FIBI drill-down (charge date,
+cleared side)**.
+
+### FIBI drill-down HTML — validated, parser hardened
+
+Real response confirmed (HTTP 200). Exact data-table header + column order:
+`תאריך עסקה | תאריך חיוב | שם העסק | סכום עסקה | סכום חיוב | פירוט`
+(purchase DD/MM/YYYY, charge DD/MM/YYYY, merchant, deal amount, charge amount, empty).
+`parseFibiCardExpenses` now **anchors on the Hebrew header labels** (parses only rows
+after the header, ignoring the surrounding page-chrome rows), reads 6 columns, handles
+`DD/MM/YYYY` + thousands separators + trailing `&nbsp;`, and falls back to shape-based
+scanning if no header is found. `__fixtures__/fibiCardExpenses.html` is a **sanitized**
+fixture (fake merchants/amounts, real layout). `תאריך חיוב` → `processedDate`.
+
+### Enrichment step + matching heuristic (`src/scraper/cardChargeDates.ts`)
+
+Cross-source: FIBI supplies the charge date, Isracard supplies the row we clear.
+`matchChargeDatesToGranular(granular, expenses)` matches each drill-down row to an
+Isracard granular transaction by:
+
+- **normalized merchant** — `trim` + collapse whitespace (incl. trailing `&nbsp;`) +
+  `toLocaleLowerCase` (the two sources differ on trailing spaces / casing),
+- **`|amount|` in integer minor units** (both sources store ILS; sign-insensitive),
+- **purchase date as an Asia/Jerusalem calendar date** (TZ-safe).
+  Each granular row is **consumed at most once**, so an N-purchase settlement maps its N
+  drill-down rows onto N distinct granular transactions (N:1 by debit, 1:1 by purchase).
+  On a match it sets `granular.processedDate = chargeDate`; the provider then clears it on
+  that date. Unmatched drill-down rows are reported, not forced.
+
+### Session hookup — REACHABLE and WIRED (not blocked)
+
+The fork **owns** each account's `browserContext` (`scrapeAccounts` creates it via
+`createSecureBrowserContext` and passes it into both the scraper and `scrapeAccount`),
+and contexts stay authenticated until `browser.close()` at the very end — exactly how
+`mergeIsracardPending` already reuses the Isracard session. israeli-bank-scrapers needs
+no page/hook exposure and **no re-auth**.
+
+Because the enrichment is **cross-account** (FIBI session + Isracard granular txns), it
+runs as a **post-scrape step** in `scrapeAccounts`, after `parallelLimit` and before
+`browser.close()`, gated on `clearOnChargeDate` (default off → zero flow change):
+`enrichCardChargeDates(results, contextByCompany)` collects the FIBI `ישראכרט`
+settlement debits + the Isracard completed granular rows, fetches each debit's drill-down
+via the retained FIBI context, and stamps the charge dates in place. Best-effort: any
+failure logs and leaves transactions untouched.
+
+### The one remaining unknown for the dry-run
+
+`settlementRefFromDebit` builds `I-SEL-MS-KARTIS` from **one** live example:
+`0` + 4-digit card + 7-digit zero-padded אסמכתא (card 0041 + ref 13795 → `000410013795`),
+with the reference taken from the debit's `identifier` and the charge date from the
+debit's own date. **This encoding + the assumption that `identifier` IS the אסמכתא are
+UNVERIFIED across debits.** The owner-gated LOCAL-JSON dry-run should confirm: (a) the
+FIBI settlement debit's `identifier`/description actually yield the right `I-SEL-MS-KARTIS`
+(watch the drill-down HTTP status), and (b) merchant strings match closely enough between
+FIBI and Isracard (else widen `normalizeMerchant`). Everything else (parser, matcher,
+provider, wiring) is code-complete and unit-tested; only this ref encoding rides on a
+single sample.
+
+### Next step
+
+Owner-gated **dry-run to LOCAL JSON** with `clearOnChargeDate` on: verify the drill-down
+fetch resolves and the enriched `processedDate` values land on the right days, before
+pointing at the real Actual budget.

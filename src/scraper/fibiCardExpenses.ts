@@ -70,37 +70,71 @@ function stripTags(html: string): string {
     .replace(/<[^>]*>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
     .replace(/\s+/g, " ")
     .trim();
 }
 
-// dd.mm.yyyy or dd/mm/yyyy (FIBI uses dots; be lenient).
+// FIBI renders DD/MM/YYYY (validated live 2026-08-02); accept dots too, and a
+// 2-digit year, for resilience.
 const DATE_RE = /(\d{2})[./](\d{2})[./](\d{2,4})/;
 // A signed ILS amount like "28.00" / "1,234.56" / "-15.00".
 const AMOUNT_RE = /-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?/;
+
+// The validated header labels (in column order). We locate the data table by
+// these rather than by position, because the table sits among page-chrome rows.
+const HEADER_PURCHASE = "תאריך עסקה";
+const HEADER_CHARGE = "תאריך חיוב";
+const HEADER_MERCHANT = "שם העסק";
 
 function parseAmount(raw: string): number {
   return Number(raw.replace(/,/g, ""));
 }
 
+function cellsOf(rowHtml: string): string[] {
+  return (rowHtml.match(/<t[dh][\s\S]*?<\/t[dh]>/gi) ?? []).map(stripTags);
+}
+
 /**
- * Parse the drill-down HTML table into itemised expenses. Tolerant by design:
- * it scans table rows, and accepts any row exposing two dates (purchase, charge)
- * + a merchant + two amounts. Header/footer rows without that shape are skipped.
+ * Parse the FIBI SUGBAKA=211 drill-down HTML into itemised expenses.
  *
- * The exact column order is asserted by the fixture test; if a live capture
- * shows a different layout, update the fixture and this mapping together.
+ * Validated live (2026-08-02, docs/card-lifecycle-design.md). The data table has
+ * this exact header + column order:
+ *   תאריך עסקה | תאריך חיוב | שם העסק | סכום עסקה | סכום חיוב | פירוט
+ * Data rows: purchaseDate(DD/MM/YYYY) | chargeDate(DD/MM/YYYY) | merchant |
+ *            dealAmount | chargeAmount | (empty detail cell).
+ * A settlement with N purchases yields N data rows.
+ *
+ * The table is embedded among page-chrome rows, so we anchor on the Hebrew
+ * header labels: parse only rows AFTER the header row, and only those with the
+ * expected shape (two dates + merchant + a charge amount). Chrome rows lack that
+ * shape and are ignored.
  */
 export function parseFibiCardExpenses(html: string): FibiCardExpense[] {
   const expenses: FibiCardExpense[] = [];
   const rowMatches = html.match(/<tr[\s\S]*?<\/tr>/gi) ?? [];
 
-  for (const rowHtml of rowMatches) {
-    const cells = (rowHtml.match(/<td[\s\S]*?<\/td>/gi) ?? []).map(stripTags);
+  // Anchor: find the header row carrying the validated labels.
+  const headerIdx = rowMatches.findIndex((r) => {
+    const text = stripTags(r);
+    return (
+      text.includes(HEADER_PURCHASE) &&
+      text.includes(HEADER_CHARGE) &&
+      text.includes(HEADER_MERCHANT)
+    );
+  });
+
+  // If the header is present, parse only rows after it; otherwise fall back to
+  // shape-based scanning of every row (still safe — the shape check is strict).
+  const dataRows =
+    headerIdx === -1 ? rowMatches : rowMatches.slice(headerIdx + 1);
+
+  for (const rowHtml of dataRows) {
+    const cells = cellsOf(rowHtml);
     if (cells.length < 5) continue;
 
-    // Columns (per the design doc): purchase date | charge date | merchant |
-    // deal amount | charge amount.
+    // Columns (validated): purchase date | charge date | merchant |
+    // deal amount | charge amount | (detail).
     const [purchaseCell, chargeCell, merchantCell, dealCell, chargeAmtCell] =
       cells;
 
@@ -111,6 +145,9 @@ export function parseFibiCardExpenses(html: string): FibiCardExpense[] {
     const merchant = merchantCell.trim();
 
     if (!purchaseDate || !chargeDate || !merchant || !chargeMatch) continue;
+    // A merchant column that is itself a date/amount means we mis-aligned on a
+    // chrome row — skip.
+    if (DATE_RE.test(merchant)) continue;
 
     expenses.push({
       purchaseDate,
@@ -165,16 +202,19 @@ export function convertFibiExpenseToTransaction(
  * Fetch + parse the itemised card expenses for a set of settlement debits,
  * reusing the already authenticated FIBI browser context. Read-only, best
  * effort: on any failure it logs and returns what it has, so the standard import
- * is unaffected.
+ * is unaffected. Returns the raw parsed rows (purchase date, charge date,
+ * merchant, amounts) — the enrichment matcher keys the real bank charge date
+ * onto the Isracard granular transaction; see `cardChargeDates.ts`.
  *
- * NOTE: unverified against a live session (owner-gated). Not wired into the
- * scrape flow yet — call it explicitly once the response shape is confirmed.
+ * NOTE: the drill-down HTML is validated (2026-08-02); the live session hookup
+ * and the `I-SEL-MS-KARTIS` ref construction still need an owner-gated dry-run
+ * (see docs/impl-notes-card-lifecycle.md).
  */
 export async function fetchFibiCardExpenses(
   browserContext: BrowserContext,
   settlements: FibiSettlementRef[],
-): Promise<Transaction[]> {
-  const out: Transaction[] = [];
+): Promise<FibiCardExpense[]> {
+  const out: FibiCardExpense[] = [];
   let page;
   try {
     page = await browserContext.newPage();
@@ -187,9 +227,7 @@ export async function fetchFibiCardExpenses(
         });
         const html = (await resp?.text()) ?? "";
         const expenses = parseFibiCardExpenses(html);
-        for (const e of expenses) {
-          out.push(convertFibiExpenseToTransaction(e));
-        }
+        out.push(...expenses);
         logger(
           `parsed ${expenses.length} expense(s) for settlement ${ref.cardStatementRef} @ ${ref.chargeDate}`,
         );

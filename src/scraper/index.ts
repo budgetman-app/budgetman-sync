@@ -10,6 +10,12 @@ import type { BrowserContext } from "puppeteer";
 import { parallelLimit } from "async";
 import { config } from "../config.js";
 import { fetchIsracardPendingByAccount } from "./isracardPending.js";
+import {
+  enrichFibiCardChargeDates,
+  isIsracardSettlementDebit,
+} from "./cardChargeDates.js";
+import type { Transaction } from "israeli-bank-scrapers/lib/transactions.js";
+import { TransactionStatuses } from "israeli-bank-scrapers/lib/transactions.js";
 
 const logger = createLogger("scraper");
 
@@ -56,6 +62,11 @@ export async function scrapeAccounts(
   const browser = await createBrowser();
   logger(`Browser created, starting to scrape ${accounts.length} accounts`);
 
+  // Retain each account's authenticated browser context so a post-scrape,
+  // cross-account step (card charge-date enrichment) can reuse the FIBI session
+  // after all scrapes finish. Contexts stay alive until browser.close() below.
+  const contextByCompany = new Map<CompanyTypes, BrowserContext>();
+
   const results = await parallelLimit<AccountConfig, AccountScrapeResult[]>(
     accounts.map((account, i) => async () => {
       const { companyId } = account;
@@ -66,6 +77,7 @@ export async function scrapeAccounts(
             browser,
             companyId,
           );
+          contextByCompany.set(companyId, browserContext);
           return scrapeAccount(
             account,
             {
@@ -90,6 +102,8 @@ export async function scrapeAccounts(
     }),
     Number(parallelScrapers),
   );
+  await enrichCardChargeDates(results, contextByCompany);
+
   const duration = (performance.now() - start) / 1000;
   logger(`scraping ended, total duration: ${duration.toFixed(1)}s`);
   await scrapeStatusChanged?.(status, duration);
@@ -196,4 +210,62 @@ async function mergeIsracardPending(
   } catch (e) {
     logger(`failed to merge Isracard pending`, e);
   }
+}
+
+/**
+ * budgetman card-lifecycle enrichment (#14, opt-in via `actual.clearOnChargeDate`,
+ * default off). Cross-account post-step: FIBI (beinleumi) holds the authoritative
+ * bank CHARGE DATE (via its SUGBAKA=211 settlement drill-down) while Isracard
+ * holds the merchant-named granular purchase. Using FIBI's still-authenticated
+ * session, fetch each `NNNN - ישראכרט` settlement debit's drill-down and stamp
+ * the real charge date onto the matching Isracard granular transaction's
+ * `processedDate`, so the Actual provider clears it on the day it hit the bank.
+ * Best effort — never fails the scrape. Mutates the granular transactions in the
+ * results in place.
+ */
+async function enrichCardChargeDates(
+  results: AccountScrapeResult[],
+  contextByCompany: Map<CompanyTypes, BrowserContext>,
+): Promise<void> {
+  if (!config.storage.actual?.clearOnChargeDate) return;
+
+  const fibiContext = contextByCompany.get(CompanyTypes.beinleumi);
+  if (!fibiContext) {
+    logger("clearOnChargeDate: no FIBI (beinleumi) session; skipping");
+    return;
+  }
+
+  const settlementDebits: Transaction[] = [];
+  const isracardGranular: Transaction[] = [];
+  for (const { companyId, result } of results) {
+    if (!result.success) continue;
+    for (const account of result.accounts ?? []) {
+      for (const tx of account.txns) {
+        if (
+          companyId === CompanyTypes.beinleumi &&
+          isIsracardSettlementDebit(tx)
+        ) {
+          settlementDebits.push(tx);
+        } else if (
+          companyId === CompanyTypes.isracard &&
+          tx.status === TransactionStatuses.Completed
+        ) {
+          isracardGranular.push(tx);
+        }
+      }
+    }
+  }
+
+  if (settlementDebits.length === 0 || isracardGranular.length === 0) {
+    logger(
+      `clearOnChargeDate: nothing to enrich (${settlementDebits.length} debit(s), ${isracardGranular.length} granular)`,
+    );
+    return;
+  }
+
+  await enrichFibiCardChargeDates(
+    fibiContext,
+    settlementDebits,
+    isracardGranular,
+  );
 }

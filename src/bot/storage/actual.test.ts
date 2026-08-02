@@ -56,6 +56,7 @@ jest.mock("@actual-app/api", () => {
 
 import * as actualApi from "@actual-app/api";
 import { ActualBudgetStorage } from "./actual.js";
+import { matchChargeDatesToGranular } from "../../scraper/cardChargeDates.js";
 
 const storeOf = () => (actualApi as any).__store() as any[];
 const resetStore = () => (actualApi as any).__reset();
@@ -305,6 +306,67 @@ describe("ActualBudgetStorage clearOnChargeDate (card lifecycle, #14)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].cleared).toBe(true);
     expect(rows[0].date).toBe("2026-07-03"); // purchase date (UTC path, unchanged)
+  });
+});
+
+describe("card lifecycle end-to-end: Isracard pending(named) -> FIBI charge date", () => {
+  beforeEach(() => resetStore());
+
+  it("enrichment sets the charge date; the named pending collapses to one cleared row on it", async () => {
+    const cfg = { clearOnChargeDate: true };
+    const named = (over: Partial<TransactionRow>) =>
+      row({
+        description: "רי באר",
+        originalAmount: -28,
+        originalCurrency: "ILS",
+        chargedAmount: -28,
+        date: "2026-07-29T13:00:00.000Z", // purchase
+        processedDate: "2026-07-29T13:00:00.000Z",
+        ...over,
+      });
+
+    // 1) Isracard pending (named) imports uncleared on the purchase date.
+    await save(
+      [named({ status: TransactionStatuses.Pending, uniqueId: "p" })],
+      cfg,
+    );
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false);
+    expect(rows[0].date).toBe("2026-07-29");
+    rows[0].category = "cat-groceries"; // human categorizes it
+
+    // 2) Isracard settles with the WRONG monthly processedDate (08-19)...
+    const settled = named({
+      status: TransactionStatuses.Completed,
+      processedDate: "2026-08-19T00:00:00.000Z",
+      identifier: "V-RIBEER",
+      uniqueId: "s",
+    });
+    // ...the FIBI drill-down enrichment rewrites it to the real charge date.
+    const res = matchChargeDatesToGranular(
+      [settled],
+      [
+        {
+          purchaseDate: "29/07/2026",
+          chargeDate: "31/07/2026",
+          merchant: "רי באר ",
+          dealAmount: 28,
+          chargeAmount: 28,
+        },
+      ],
+    );
+    expect(res.updated).toBe(1);
+    expect(settled.processedDate).toBe("2026-07-31T00:00:00.000Z");
+
+    // 3) the settled row collapses onto the pending twin: one cleared row on the
+    // real charge date, category preserved.
+    await save([settled], cfg);
+    rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].date).toBe("2026-07-31");
+    expect(rows[0].category).toBe("cat-groceries");
   });
 });
 
