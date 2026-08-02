@@ -54,6 +54,19 @@ export const ActualSchema = z.object({
   // originalAmount+originalCurrency key and update the row in place.
   keepPending: z.boolean().default(false),
   upsert: z.boolean().default(false),
+  // clearOnChargeDate (budgetman card lifecycle, #14): when on, a SETTLED
+  // domestic card charge is written to Actual dated on its real BANK CHARGE
+  // DATE (the transaction's processedDate — set by the FIBI settlement
+  // drill-down / Isracard "מחוץ למועד" bank-charge-date enrichment) instead of
+  // the purchase date, and marked cleared; the still-pending twin stays
+  // uncleared at the purchase date. This is what makes Actual's cleared balance
+  // reconstruct FIBI's posted running balance day-by-day. The pending<->settled
+  // MATCH key still uses the purchase date, so the collapse is unaffected.
+  // TRAP: only meaningful once processedDate carries the true charge date (the
+  // raw israeli-bank-scrapers Isracard feed reports the monthly statement date,
+  // NOT the bank charge date — see docs/impl-notes-card-lifecycle.md). Requires
+  // upsert. Default off leaves the purchase-date/clear-on-complete behavior.
+  clearOnChargeDate: z.boolean().default(false),
   // excludeDescriptions: case-insensitive regular expressions; a transaction
   // whose description matches any of them is dropped before import. Needed when
   // a card and the checking account it settles against both map to the same

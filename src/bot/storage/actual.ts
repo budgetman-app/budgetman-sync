@@ -19,6 +19,7 @@ import {
   type ExistingActualTx,
   type IncomingTx,
 } from "./actualUpsert.js";
+import { toJerusalemDate } from "./dates.js";
 
 const logger = createLogger("ActualBudgetStorage");
 
@@ -321,13 +322,51 @@ export class ActualBudgetStorage implements TransactionStorage {
     );
   }
 
+  /**
+   * A card-issuer charge whose real clearing date is the bank CHARGE date, not
+   * the purchase date. Broader than `isDomesticCardCharge` (which gates the
+   * legacy FIBI-auth<->Isracard card-key matcher on `cardPendingDescriptions`):
+   * charge-date clearing applies to any card-issuer row, so it is keyed off the
+   * company rather than that opt-in config.
+   */
+  private isCardCharge(tx: TransactionRow): boolean {
+    return (
+      tx.companyId === CompanyTypes.isracard || this.isDomesticCardCharge(tx)
+    );
+  }
+
   private toIncoming(tx: TransactionRow): IncomingTx {
-    const date = new Date(tx.date).toISOString().split("T")[0];
+    const isPending = tx.status === TransactionStatuses.Pending;
+    // `isCardKey` decides the MATCH key (unchanged); `isCardCharge` decides
+    // charge-date clearing (new, flag-gated).
+    const isCardKey = this.isDomesticCardCharge(tx);
+    const clearOnChargeDate = Boolean(
+      this.config.storage.actual?.clearOnChargeDate,
+    );
+
+    // The MATCH key always uses the purchase date so a pending charge and its
+    // settled twin share a base key (the settled row may be dated on a later
+    // bank charge date — that must not break the collapse). Under the new flag
+    // the purchase date is formatted TZ-safely; otherwise the upstream UTC
+    // formatting is preserved so default behavior is byte-for-byte unchanged.
+    const keyDate = clearOnChargeDate
+      ? toJerusalemDate(tx.date)
+      : new Date(tx.date).toISOString().split("T")[0];
+
+    // The Actual ROW date. A settled domestic card charge is dated on its real
+    // bank charge date (processedDate — set by the FIBI drill-down / Isracard
+    // "מחוץ למועד" enrichment) so cleared rows reconstruct FIBI's running
+    // balance. Pending rows stay on the purchase date (uncleared).
+    const rowDate =
+      clearOnChargeDate && this.isCardCharge(tx) && !isPending
+        ? toJerusalemDate(tx.processedDate ?? tx.date)
+        : keyDate;
+
     const amount = actualApi.utils.amountToInteger(tx.chargedAmount);
-    const baseKey = this.isDomesticCardCharge(tx)
-      ? computeCardKey({ date, amountMinor: amount })
+    const baseKey = isCardKey
+      ? computeCardKey({ date: keyDate, amountMinor: amount })
       : computeStableKey({
-          date,
+          date: keyDate,
           originalAmount: tx.originalAmount,
           originalCurrency: tx.originalCurrency,
           description: tx.description,
@@ -336,9 +375,9 @@ export class ActualBudgetStorage implements TransactionStorage {
     return {
       baseKey,
       settledImportedId: this.settledImportedId(tx),
-      isPending: tx.status === TransactionStatuses.Pending,
+      isPending,
       amount,
-      date,
+      date: rowDate,
       payeeName: tx.description,
       notes: tx.memo ?? "",
     };
@@ -395,7 +434,11 @@ export class ActualBudgetStorage implements TransactionStorage {
         notes: e.notes ?? null,
       }));
 
-      const plan = planActualUpsert(incoming, existing);
+      const plan = planActualUpsert(incoming, existing, {
+        updateDateOnSettle: Boolean(
+          this.config.storage.actual?.clearOnChargeDate,
+        ),
+      });
       logger(
         `[${accountName}] upsert plan: ${plan.adds.length} add, ${plan.updates.length} update`,
       );

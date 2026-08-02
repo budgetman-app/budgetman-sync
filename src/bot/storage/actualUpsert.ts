@@ -52,6 +52,12 @@ export interface PlannedUpdate {
     cleared?: boolean;
     imported_id?: string;
     notes?: string;
+    /**
+     * Only present when `updateDateOnSettle` is on (card-lifecycle #14): moves a
+     * settled card row from its pending purchase date to the real bank charge
+     * date so cleared rows line up with FIBI's posted running balance.
+     */
+    date?: string;
   };
 }
 
@@ -123,9 +129,21 @@ function baseOf(importedId: string): string | null {
  * Decide what to add and what to update in Actual for a single account.
  * Idempotent: re-running with the same inputs produces no changes once settled.
  */
+export interface PlanOptions {
+  /**
+   * When settling a pending twin in place, also move its date to the settled
+   * row's date (the real bank charge date). Off by default so the FX/pending
+   * upsert path is byte-for-byte unchanged; the provider turns it on only under
+   * `actual.clearOnChargeDate`. New settled rows (no pending twin) always carry
+   * their own date via the add path, independent of this flag.
+   */
+  updateDateOnSettle?: boolean;
+}
+
 export function planActualUpsert(
   incoming: IncomingTx[],
   existing: ExistingActualTx[],
+  options: PlanOptions = {},
 ): UpsertPlan {
   const adds: PlannedAdd[] = [];
   const updates: PlannedUpdate[] = [];
@@ -204,6 +222,7 @@ export function planActualUpsert(
             cleared: true,
             imported_id: tx.settledImportedId,
             notes: `settled ₪${ils(twin.amount)}→₪${ils(tx.amount)}`,
+            ...(options.updateDateOnSettle ? { date: tx.date } : {}),
           },
         });
         report.push(

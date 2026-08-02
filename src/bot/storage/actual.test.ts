@@ -194,6 +194,120 @@ describe("ActualBudgetStorage upsert (pending -> settled)", () => {
   });
 });
 
+describe("ActualBudgetStorage clearOnChargeDate (card lifecycle, #14)", () => {
+  beforeEach(() => resetStore());
+
+  // A domestic Isracard card charge. Purchase 2026-07-03; once settled the FIBI
+  // drill-down / Isracard enrichment stamps processedDate with the real bank
+  // charge date (2026-07-30T21:00Z = 2026-07-31 in Israel — also exercises the
+  // 21:00Z off-by-one the TZ-safe formatter must get right).
+  const PURCHASE = "2026-07-03T13:27:00.000Z";
+  const CHARGE = "2026-07-30T21:00:00.000Z";
+  const cfg = { clearOnChargeDate: true };
+  const card = (over: Partial<TransactionRow>) =>
+    row({
+      description: "רי באר",
+      originalAmount: -28,
+      originalCurrency: "ILS",
+      chargedAmount: -28,
+      date: PURCHASE,
+      processedDate: PURCHASE,
+      ...over,
+    });
+
+  it("pending imports uncleared, dated on the purchase date", async () => {
+    await save(
+      [card({ status: TransactionStatuses.Pending, uniqueId: "p" })],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false);
+    expect(rows[0].date).toBe("2026-07-03");
+  });
+
+  it("settled clears and re-dates onto the real charge date; one row, category kept", async () => {
+    await save(
+      [card({ status: TransactionStatuses.Pending, uniqueId: "p" })],
+      cfg,
+    );
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    rows[0].category = "cat-groceries";
+
+    await save(
+      [
+        card({
+          status: TransactionStatuses.Completed,
+          processedDate: CHARGE, // real bank charge date
+          identifier: "V-RIBEER",
+          uniqueId: "s",
+        }),
+      ],
+      cfg,
+    );
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // collapsed, no duplicate
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].date).toBe("2026-07-31"); // charge date, TZ-safe (Israel)
+    expect(rows[0].category).toBe("cat-groceries"); // preserved
+  });
+
+  it("records the settle note in place on collapse", async () => {
+    await save(
+      [card({ status: TransactionStatuses.Pending, uniqueId: "p" })],
+      cfg,
+    );
+    await save(
+      [
+        card({
+          status: TransactionStatuses.Completed,
+          processedDate: CHARGE,
+          uniqueId: "s",
+        }),
+      ],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].notes).toBe("settled ₪28.00→₪28.00");
+  });
+
+  it("a settled charge with no pending twin adds directly on the charge date", async () => {
+    await save(
+      [
+        card({
+          status: TransactionStatuses.Completed,
+          processedDate: CHARGE,
+          uniqueId: "s",
+        }),
+      ],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].date).toBe("2026-07-31");
+  });
+
+  it("is off by default: settled card row keeps the purchase date", async () => {
+    await save(
+      [
+        card({
+          status: TransactionStatuses.Completed,
+          processedDate: CHARGE,
+          uniqueId: "s",
+        }),
+      ],
+      {}, // clearOnChargeDate not set
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].date).toBe("2026-07-03"); // purchase date (UTC path, unchanged)
+  });
+});
+
 describe("ActualBudgetStorage excludeDescriptions", () => {
   beforeEach(() => resetStore());
 

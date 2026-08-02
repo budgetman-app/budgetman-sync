@@ -188,6 +188,33 @@ describe("planActualUpsert", () => {
   });
 });
 
+describe("planActualUpsert updateDateOnSettle (card charge date, #14)", () => {
+  it("moves the settled row's date to the charge date when enabled", () => {
+    const existing = [existingPending({ amount: -2800 })];
+    const { updates } = planActualUpsert(
+      // pending was dated on the purchase date; settled carries the charge date
+      [settled({ amount: -2800, date: "2026-07-31" })],
+      existing,
+      { updateDateOnSettle: true },
+    );
+    expect(updates).toHaveLength(1);
+    expect(updates[0].fields.date).toBe("2026-07-31");
+    expect(updates[0].fields.cleared).toBe(true);
+    // category is still never touched
+    expect("category" in updates[0].fields).toBe(false);
+  });
+
+  it("omits the date field by default (path unchanged when off)", () => {
+    const existing = [existingPending({ amount: -2800 })];
+    const { updates } = planActualUpsert(
+      [settled({ amount: -2800, date: "2026-07-31" })],
+      existing,
+    );
+    expect(updates).toHaveLength(1);
+    expect("date" in updates[0].fields).toBe(false);
+  });
+});
+
 describe("computeCardKey", () => {
   it("matches a bank pending authorization to the card issuer's settled row", () => {
     // Same domestic amount + purchase date, different descriptions/accounts.
