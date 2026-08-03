@@ -213,25 +213,33 @@ async function mergeIsracardPending(
 }
 
 /**
- * budgetman card-lifecycle enrichment (#14, opt-in via `actual.clearOnChargeDate`,
- * default off). Cross-account post-step: FIBI (beinleumi) holds the authoritative
- * bank CHARGE DATE (via its SUGBAKA=211 settlement drill-down) while Isracard
- * holds the merchant-named granular purchase. Using FIBI's still-authenticated
- * session, fetch each `NNNN - ישראכרט` settlement debit's drill-down and stamp
- * the real charge date onto the matching Isracard granular transaction's
- * `processedDate`, so the Actual provider clears it on the day it hit the bank.
- * Best effort — never fails the scrape. Mutates the granular transactions in the
- * results in place.
+ * budgetman card-lifecycle enrichment (#14, opt-in, default off). Fires when
+ * `scraping.enrichCardChargeDates` (a scraping step, dry-runnable to localJson)
+ * OR `actual.clearOnChargeDate` (production, which also clears on the date) is on.
+ * Cross-account post-step: FIBI (beinleumi) holds the authoritative bank CHARGE
+ * DATE (via its SUGBAKA=211 settlement drill-down) while Isracard holds the
+ * merchant-named granular purchase. Using FIBI's still-authenticated session,
+ * fetch each `NNNN - ישראכרט` settlement debit's drill-down and stamp the real
+ * charge date onto the matching Isracard granular transaction's `processedDate`,
+ * so the Actual provider clears it on the day it hit the bank. Best effort —
+ * never fails the scrape. Mutates the granular transactions in the results in
+ * place.
  */
 async function enrichCardChargeDates(
   results: AccountScrapeResult[],
   contextByCompany: Map<CompanyTypes, BrowserContext>,
 ): Promise<void> {
-  if (!config.storage.actual?.clearOnChargeDate) return;
+  // Enrich when explicitly requested as a scraping step (dry-run to localJson) OR
+  // when the Actual provider will clear on the charge date (production). The
+  // provider's clearing stays gated on clearOnChargeDate alone (unchanged).
+  const wantEnrich =
+    config.options.scraping.enrichCardChargeDates ||
+    Boolean(config.storage.actual?.clearOnChargeDate);
+  if (!wantEnrich) return;
 
   const fibiContext = contextByCompany.get(CompanyTypes.beinleumi);
   if (!fibiContext) {
-    logger("clearOnChargeDate: no FIBI (beinleumi) session; skipping");
+    logger("enrichCardChargeDates: no FIBI (beinleumi) session; skipping");
     return;
   }
 
@@ -258,7 +266,7 @@ async function enrichCardChargeDates(
 
   if (settlementDebits.length === 0 || isracardGranular.length === 0) {
     logger(
-      `clearOnChargeDate: nothing to enrich (${settlementDebits.length} debit(s), ${isracardGranular.length} granular)`,
+      `enrichCardChargeDates: nothing to enrich (${settlementDebits.length} debit(s), ${isracardGranular.length} granular)`,
     );
     return;
   }

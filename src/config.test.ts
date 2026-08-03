@@ -215,6 +215,24 @@ describe("config", () => {
       expect(parsed.storage.actual).toBeUndefined();
     });
 
+    it("defaults scraping.enrichCardChargeDates to false", () => {
+      const parsed = MoneymanConfigSchema.parse({
+        storage: { actual: { ...baseActual } },
+      });
+      expect(parsed.options.scraping.enrichCardChargeDates).toBe(false);
+    });
+
+    it("accepts scraping.enrichCardChargeDates independently of any storage", () => {
+      // Lets the FIBI charge-date enrichment be dry-run to localJson (the dumped
+      // JSON shows the corrected processedDate) with no Actual configured.
+      const parsed = MoneymanConfigSchema.parse({
+        storage: { localJson: { enabled: true } },
+        options: { scraping: { enrichCardChargeDates: true } },
+      });
+      expect(parsed.options.scraping.enrichCardChargeDates).toBe(true);
+      expect(parsed.storage.actual).toBeUndefined();
+    });
+
     it("rejects an invalid regular expression at config time", () => {
       // Better to fail loudly on load than to throw mid-scrape.
       expect(() =>

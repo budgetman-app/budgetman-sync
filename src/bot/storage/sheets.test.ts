@@ -175,6 +175,7 @@ describe("GoogleSheetsStorage", () => {
             daysBack: 10,
             futureMonths: 1,
             includePendingCharges: false,
+            enrichCardChargeDates: false,
             transactionHashType: "",
             additionalTransactionInfo: false,
             includeRawTransaction: false,

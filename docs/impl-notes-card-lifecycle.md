@@ -176,8 +176,37 @@ FIBI and Isracard (else widen `normalizeMerchant`). Everything else (parser, mat
 provider, wiring) is code-complete and unit-tested; only this ref encoding rides on a
 single sample.
 
+### How to dry-run to LOCAL JSON (no Actual writes)
+
+The enrichment is a **scraping** step, so it can run and dump its result to a local JSON
+file with zero Actual involvement. It fires when `options.scraping.enrichCardChargeDates`
+is true **or** `storage.actual.clearOnChargeDate` is true (the provider's clearing stays
+gated on `clearOnChargeDate` alone). For a pure dry-run, use the scraping flag with no
+`storage.actual` at all:
+
+```jsonc
+{
+  "accounts": [
+    /* FIBI (beinleumi) + Isracard creds */
+  ],
+  "storage": { "localJson": { "enabled": true } },
+  "options": {
+    "scraping": {
+      "enrichCardChargeDates": true, // run the FIBI drill-down enrichment
+      "includePendingCharges": true, // also surface the Isracard pending (named) side
+    },
+  },
+}
+```
+
+The dumped JSON's Isracard card rows will show `processedDate` rewritten to the real FIBI
+charge date (vs the raw monthly statement date) — the thing to eyeball. Because there is
+no `storage.actual`, nothing is written to Actual. In production, set
+`storage.actual.clearOnChargeDate: true` instead: the same enrichment runs AND the provider
+clears each card row on that date.
+
 ### Next step
 
-Owner-gated **dry-run to LOCAL JSON** with `clearOnChargeDate` on: verify the drill-down
-fetch resolves and the enriched `processedDate` values land on the right days, before
-pointing at the real Actual budget.
+Owner-gated **dry-run to LOCAL JSON** (config above): verify the drill-down fetch resolves
+(watch the `I-SEL-MS-KARTIS` ref + HTTP status) and the enriched `processedDate` values land
+on the right days, before pointing at the real Actual budget with `clearOnChargeDate`.

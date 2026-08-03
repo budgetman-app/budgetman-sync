@@ -183,6 +183,16 @@ export const ScrapingOptionsSchema = z.object({
   // under a storage provider — a run can then be validated with localJson before
   // anything is written to a real ledger.
   includePendingCharges: z.boolean().default(false),
+  // (budgetman card lifecycle #14, opt-in, default false) Run the FIBI settlement
+  // drill-down enrichment: rewrite each Isracard card transaction's processedDate
+  // to the REAL bank charge date fetched from FIBI's SUGBAKA=211 drill-down (see
+  // docs/impl-notes-card-lifecycle.md). Like includePendingCharges this is a
+  // SCRAPING concern, so it can be dry-run to localJson (the dumped JSON shows the
+  // corrected processedDate) with NO Actual involvement. The Actual provider's
+  // clearing on that date is a SEPARATE switch (storage.actual.clearOnChargeDate);
+  // production turns that on, which also implies this enrichment. Enrichment fires
+  // when this OR storage.actual.clearOnChargeDate is true.
+  enrichCardChargeDates: z.boolean().default(false),
   transactionHashType: z.enum(["", "moneyman"]).default(""),
   additionalTransactionInfo: z.boolean().default(false),
   includeRawTransaction: z.boolean().default(false),
