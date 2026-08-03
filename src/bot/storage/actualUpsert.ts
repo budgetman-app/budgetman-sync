@@ -12,6 +12,15 @@ import { hash } from "hash-it";
 // key" used as the pending row's imported_id. On settle we find that twin and
 // update it in place — new amount, cleared, upgraded imported_id, a change note
 // — WITHOUT ever touching its category.
+//
+// Drift tolerance (non-card path): FIBI mutates a pending row's DATE (e.g. a
+// reserve credit re-stamped 08-02 -> 08-03) and its DESCRIPTION (e.g. a settled
+// row reading "081מופ\"ת מילואי" vs the pending "081 מופ\"ת מילואים"). Baking
+// either into the key spawns a duplicate every scrape. So the non-card key
+// (`computeStableKey`) is a date/description-INDEPENDENT signature
+// (|originalAmount| + originalCurrency + account), and the planner matches a
+// twin within a small DATE WINDOW (+/-DRIFT_WINDOW_DAYS). The card path
+// (`computeCardKey`) and legacy exact keys are unchanged.
 
 /** Minimal shape of an existing Actual transaction the planner reasons about. */
 export interface ExistingActualTx {
@@ -20,17 +29,29 @@ export interface ExistingActualTx {
   amount: number; // integer minor units (Actual convention)
   cleared: boolean;
   notes: string | null;
+  /** YYYY-MM-DD. Used to window-match a signature-keyed twin across date drift. */
+  date?: string;
 }
 
 /** A scraped transaction normalized for planning. Amounts are integer minor units. */
 export interface IncomingTx {
-  /** Stable across pending<->settled: pend:<hash(date, originalAmount, originalCurrency, merchant, account)>. */
+  /**
+   * Signature base key shared by a pending charge and its settled twin:
+   * `pend:sig_<hash(|originalAmount|, originalCurrency, account)>` (non-card),
+   * `pend:card_<date>_<amount>` (card). Also the pending row's imported_id.
+   */
   baseKey: string;
   /** imported_id to use once settled (moneyman's uniqueId/voucher-based hash). */
   settledImportedId: string;
   isPending: boolean;
   amount: number;
-  date: string; // YYYY-MM-DD
+  date: string; // YYYY-MM-DD — the Actual row date
+  /**
+   * YYYY-MM-DD used to window-match a signature-keyed twin (the purchase/key
+   * date). Distinct from `date`, which for a settled card row is the later bank
+   * charge date. Defaults to `date` when omitted.
+   */
+  matchDate?: string;
   payeeName: string;
   notes: string;
 }
@@ -70,27 +91,40 @@ export interface UpsertPlan {
 
 export const PENDING_NOTE = "PENDING";
 
+/** Pending<->settled twin match window: FIBI drifts the pending date by a day
+ * or two before it settles; a genuinely different transaction sharing the same
+ * amount signature is expected to be further apart than this. */
+export const DRIFT_WINDOW_DAYS = 4;
+
 /**
- * The FX-stable base key shared by a pending charge and its settled twin.
- * Deliberately excludes the ILS `chargedAmount` (which moves) and the
- * `identifier` (assigned only at settlement) — it keys on the invariant
- * `originalAmount + originalCurrency` plus purchase date, merchant, and account.
+ * The non-card, drift-tolerant base key shared by a pending charge and its
+ * settled twin. Deliberately a DATE- and DESCRIPTION-independent signature:
+ * signed `originalAmount` (in minor units) + `originalCurrency` + `account`.
+ * This survives FIBI re-stamping the pending date or reporting a slightly
+ * different description on settle (both re-duplicated in production). It keys on
+ * `originalAmount` — the FX-invariant — never the ILS `chargedAmount` (which
+ * moves) or the late-assigned `identifier`. The SIGN is kept: a charge keeps its
+ * sign through settlement, so signed is stable for the collapse, and it prevents
+ * a +890 credit and a −890 debit (same currency+account within the window) from
+ * wrongly collapsing — a real collision given the recurring +890 reserve credit.
+ * The planner pairs it with a date window so two genuinely distinct same-amount
+ * transactions weeks apart do not over-collapse. Trade-off: two DIFFERENT
+ * non-card transactions with the exact same signed amount+currency+account
+ * WITHIN the window collapse into one; for non-card FIBI activity
+ * (salary/government/bills) exact-agora collisions in a 4-day window are rare.
+ * Card purchases take `computeCardKey`, not this.
  */
 export function computeStableKey(fields: {
-  date: string; // YYYY-MM-DD (purchase date)
   originalAmount: number;
   originalCurrency: string;
-  description: string;
   account: string;
 }): string {
   const parts = [
-    fields.date,
-    fields.originalAmount,
+    Math.round(fields.originalAmount * 100),
     fields.originalCurrency,
-    fields.description,
     fields.account,
   ];
-  return `pend:${hash(parts.map((p) => String(p ?? "").trim()).join("_")).toString()}`;
+  return `pend:sig_${hash(parts.map((p) => String(p ?? "").trim()).join("_")).toString()}`;
 }
 
 /**
@@ -123,6 +157,23 @@ function baseOf(importedId: string): string | null {
   if (!importedId.startsWith("pend:")) return null;
   const hashIdx = importedId.indexOf("#");
   return hashIdx === -1 ? importedId : importedId.slice(0, hashIdx);
+}
+
+/** Signature (drift-tolerant) keys window-match by date; card/legacy keys are
+ * matched exactly, as before. */
+function isSignatureKey(base: string): boolean {
+  return base.startsWith("pend:sig_");
+}
+
+/** Whole-day distance between two YYYY-MM-DD dates. Unknown dates are treated as
+ * in-window (0) — only the signature path consults dates, and the provider
+ * always supplies them. */
+function daysApart(a?: string, b?: string): number {
+  if (!a || !b) return 0;
+  const da = Date.parse(`${a}T00:00:00Z`);
+  const db = Date.parse(`${b}T00:00:00Z`);
+  if (Number.isNaN(da) || Number.isNaN(db)) return 0;
+  return Math.abs(da - db) / 86_400_000;
 }
 
 /**
@@ -163,44 +214,96 @@ export function planActualUpsert(
   }
 
   const consumed = new Set<string>(); // existing ids already matched this run
-  const plannedSlots = new Map<string, number>(); // baseKey -> next slot for new pending
+  const usedNewIds = new Set<string>(); // imported_ids minted for adds this run
 
-  const nextUnconsumed = (baseKey: string): ExistingActualTx | undefined =>
-    (pendingByBase.get(baseKey) ?? []).find((e) => !consumed.has(e.id));
+  const matchDateOf = (tx: IncomingTx): string => tx.matchDate ?? tx.date;
+
+  // Find the unconsumed existing twin for a base key. Card/legacy keys match
+  // exactly (as before); signature keys match the nearest row within the drift
+  // window, so a re-stamped pending date still collapses onto the same row.
+  const findTwin = (
+    baseKey: string,
+    matchDate: string,
+  ): ExistingActualTx | undefined => {
+    const candidates = (pendingByBase.get(baseKey) ?? []).filter(
+      (e) => !consumed.has(e.id),
+    );
+    if (candidates.length === 0) return undefined;
+    if (!isSignatureKey(baseKey)) return candidates[0];
+    let best: ExistingActualTx | undefined;
+    let bestDelta = Infinity;
+    for (const e of candidates) {
+      const delta = daysApart(e.date, matchDate);
+      if (delta <= DRIFT_WINDOW_DAYS && delta < bestDelta) {
+        best = e;
+        bestDelta = delta;
+      }
+    }
+    return best;
+  };
+
+  // Pick a free imported_id for a new pending add, avoiding collision with an
+  // existing row OR another add this run that shares the base key (two genuinely
+  // distinct same-signature transactions out of window must coexist).
+  const allocImportedId = (baseKey: string): string => {
+    let slot = 0;
+    let id = slotImportedId(baseKey, slot);
+    while (byImportedId.has(id) || usedNewIds.has(id)) {
+      slot++;
+      id = slotImportedId(baseKey, slot);
+    }
+    usedNewIds.add(id);
+    return id;
+  };
 
   // When a settled row and pending rows share a base key in the SAME batch, the
   // pending views are already superseded — keep only the settled. Without this,
   // once a card charge settles the pending authorization (still present in the
   // same scrape) would re-add a duplicate placeholder alongside the settled row.
-  const settledKeys = new Set(
-    incoming.filter((tx) => !tx.isPending).map((tx) => tx.baseKey),
-  );
-  const planned = incoming.filter(
-    (tx) => !(tx.isPending && settledKeys.has(tx.baseKey)),
-  );
+  // For signature keys the settled must also be within the drift window (two
+  // distinct same-signature rows in one batch must not cancel each other).
+  const settledList = incoming.filter((tx) => !tx.isPending);
+  const isSuperseded = (p: IncomingTx): boolean =>
+    settledList.some(
+      (s) =>
+        s.baseKey === p.baseKey &&
+        (!isSignatureKey(p.baseKey) ||
+          daysApart(matchDateOf(s), matchDateOf(p)) <= DRIFT_WINDOW_DAYS),
+    );
+  const planned = incoming.filter((tx) => !(tx.isPending && isSuperseded(tx)));
 
   for (const tx of planned) {
+    const matchDate = matchDateOf(tx);
     if (tx.isPending) {
-      const twin = nextUnconsumed(tx.baseKey);
+      const twin = findTwin(tx.baseKey, matchDate);
       if (twin) {
         consumed.add(twin.id);
+        const fields: PlannedUpdate["fields"] = {};
         if (twin.amount !== tx.amount) {
-          updates.push({
-            id: twin.id,
-            fields: {
-              amount: tx.amount,
-              notes: `${PENDING_NOTE} ₪${ils(twin.amount)}→₪${ils(tx.amount)}`,
-            },
-          });
+          fields.amount = tx.amount;
+          fields.notes = `${PENDING_NOTE} ₪${ils(twin.amount)}→₪${ils(tx.amount)}`;
           report.push(
             `pending updated: ${tx.payeeName} ₪${ils(twin.amount)}→₪${ils(tx.amount)}`,
           );
         }
+        // Follow FIBI's pending date drift so the match window keeps tracking it
+        // (signature keys only; card/legacy rows keep their exact date).
+        if (
+          isSignatureKey(tx.baseKey) &&
+          twin.date &&
+          twin.date !== matchDate
+        ) {
+          fields.date = matchDate;
+          report.push(
+            `pending re-dated: ${tx.payeeName} ${twin.date}→${matchDate}`,
+          );
+        }
+        if (Object.keys(fields).length > 0) {
+          updates.push({ id: twin.id, fields });
+        }
       } else {
-        const slot = plannedSlots.get(tx.baseKey) ?? 0;
-        plannedSlots.set(tx.baseKey, slot + 1);
         adds.push({
-          imported_id: slotImportedId(tx.baseKey, slot),
+          imported_id: allocImportedId(tx.baseKey),
           date: tx.date,
           amount: tx.amount,
           payee_name: tx.payeeName,
@@ -212,7 +315,7 @@ export function planActualUpsert(
     } else {
       // settled
       if (byImportedId.has(tx.settledImportedId)) continue; // already imported -> no-op
-      const twin = nextUnconsumed(tx.baseKey);
+      const twin = findTwin(tx.baseKey, matchDate);
       if (twin) {
         consumed.add(twin.id);
         updates.push({

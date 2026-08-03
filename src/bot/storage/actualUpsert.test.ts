@@ -9,27 +9,158 @@ import {
 
 describe("computeStableKey", () => {
   const charge = {
-    date: "2026-07-03",
     originalAmount: 20,
     originalCurrency: "USD",
-    description: "UPSTASH",
     account: "0041",
   };
 
-  it("is identical for a pending charge and its settled twin", () => {
-    // Settlement changes chargedAmount + identifier (not part of the key) but
-    // keeps originalAmount/originalCurrency/date/merchant — so the key matches.
+  it("is a signature independent of date and description (only amount+currency+account)", () => {
+    // The key no longer bakes date/description, so FIBI re-stamping either does
+    // not spawn a new key -> no duplicate.
     expect(computeStableKey(charge)).toBe(computeStableKey({ ...charge }));
-    expect(computeStableKey(charge).startsWith("pend:")).toBe(true);
+    expect(computeStableKey(charge).startsWith("pend:sig_")).toBe(true);
   });
 
-  it("differs when the original amount or currency differs", () => {
+  it("keys on the SIGNED amount: +X and -X get different keys (no debit/credit collapse)", () => {
+    expect(computeStableKey(charge)).not.toBe(
+      computeStableKey({ ...charge, originalAmount: -20 }),
+    );
+  });
+
+  it("differs when amount, currency, or account differ", () => {
     expect(computeStableKey(charge)).not.toBe(
       computeStableKey({ ...charge, originalCurrency: "EUR" }),
     );
     expect(computeStableKey(charge)).not.toBe(
       computeStableKey({ ...charge, originalAmount: 21 }),
     );
+    expect(computeStableKey(charge)).not.toBe(
+      computeStableKey({ ...charge, account: "9999" }),
+    );
+  });
+});
+
+describe("signature-key drift tolerance (non-card pending)", () => {
+  // Two real production bugs this fixes: a +₪890 reserve credit re-duplicating
+  // when its pending date shifted 08-02->08-03, and a +₪48 reserve credit not
+  // collapsing pending->settled because FIBI reported a slightly different
+  // description on settle.
+  const SIG = computeStableKey({
+    originalAmount: 890,
+    originalCurrency: "ILS",
+    account: "477872",
+  });
+  const sigPending = (over: Partial<IncomingTx> = {}): IncomingTx => ({
+    baseKey: SIG,
+    settledImportedId: "settled-890",
+    isPending: true,
+    amount: 89000, // +₪890 credit
+    date: "2026-08-02",
+    matchDate: "2026-08-02",
+    payeeName: "ביטוח לאומי מיל",
+    notes: "",
+    ...over,
+  });
+  const existingSig = (
+    over: Partial<ExistingActualTx> = {},
+  ): ExistingActualTx => ({
+    id: "e1",
+    imported_id: SIG,
+    amount: 89000,
+    cleared: false,
+    notes: PENDING_NOTE,
+    date: "2026-08-02",
+    ...over,
+  });
+
+  it("(a) collapses a pending credit whose date shifts 08-02 -> 08-03 into ONE row", () => {
+    const plan = planActualUpsert(
+      [sigPending({ date: "2026-08-03", matchDate: "2026-08-03" })],
+      [existingSig()],
+    );
+    expect(plan.adds).toHaveLength(0); // no duplicate
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].id).toBe("e1");
+    expect(plan.updates[0].fields.date).toBe("2026-08-03"); // window tracks the drift
+    expect("amount" in plan.updates[0].fields).toBe(false); // amount unchanged
+  });
+
+  it("(b) collapses pending -> settled despite a mutated description", () => {
+    const SIG48 = computeStableKey({
+      originalAmount: 48,
+      originalCurrency: "ILS",
+      account: "477872",
+    });
+    const existing: ExistingActualTx[] = [
+      {
+        id: "p48",
+        imported_id: SIG48,
+        amount: 4800,
+        cleared: false,
+        notes: PENDING_NOTE,
+        date: "2026-08-02",
+      },
+    ];
+    const settledDrift: IncomingTx = {
+      baseKey: SIG48, // same signature — description is NOT in the key
+      settledImportedId: "s48",
+      isPending: false,
+      amount: 4800,
+      date: "2026-08-03", // a day later, within the window
+      matchDate: "2026-08-03",
+      payeeName: '081מופ"ת מילואי', // differs from the pending "081 מופ"ת מילואים"
+      notes: "",
+    };
+    const plan = planActualUpsert([settledDrift], existing);
+    expect(plan.adds).toHaveLength(0); // collapses, no duplicate
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].id).toBe("p48");
+    expect(plan.updates[0].fields).toMatchObject({
+      cleared: true,
+      imported_id: "s48",
+    });
+  });
+
+  it("(c) does not over-collapse two distinct same-amount transactions weeks apart", () => {
+    const existing: ExistingActualTx[] = [
+      existingSig({ id: "old", date: "2026-07-10" }), // weeks before
+    ];
+    const plan = planActualUpsert(
+      [sigPending({ date: "2026-08-02", matchDate: "2026-08-02" })],
+      existing,
+    );
+    expect(plan.updates).toHaveLength(0); // the 07-10 row is out of window
+    expect(plan.adds).toHaveLength(1); // a new, distinct pending row
+    expect(plan.adds[0].imported_id).toBe(`${SIG}#1`); // coexists, no id collision
+  });
+
+  it("is idempotent: re-scraping an unchanged pending row does nothing", () => {
+    const plan = planActualUpsert([sigPending()], [existingSig()]);
+    expect(plan.adds).toHaveLength(0);
+    expect(plan.updates).toHaveLength(0);
+  });
+
+  it("does NOT collapse a -890 debit onto the +890 credit within the window", () => {
+    // Same currency+account+day, opposite sign: signed key keeps them distinct.
+    const debitKey = computeStableKey({
+      originalAmount: -890,
+      originalCurrency: "ILS",
+      account: "477872",
+    });
+    expect(debitKey).not.toBe(SIG);
+    const plan = planActualUpsert(
+      [
+        sigPending({
+          baseKey: debitKey,
+          amount: -89000, // -₪890 debit, same day as the +890 credit row
+          payeeName: "חיוב כלשהו",
+        }),
+      ],
+      [existingSig()], // the +₪890 credit
+    );
+    expect(plan.updates).toHaveLength(0); // credit untouched
+    expect(plan.adds).toHaveLength(1); // debit added as its own row
+    expect(plan.adds[0].imported_id).toBe(debitKey);
   });
 });
 

@@ -366,10 +366,8 @@ export class ActualBudgetStorage implements TransactionStorage {
     const baseKey = isCardKey
       ? computeCardKey({ date: keyDate, amountMinor: amount })
       : computeStableKey({
-          date: keyDate,
           originalAmount: tx.originalAmount,
           originalCurrency: tx.originalCurrency,
-          description: tx.description,
           account: tx.account,
         });
     return {
@@ -378,6 +376,10 @@ export class ActualBudgetStorage implements TransactionStorage {
       isPending,
       amount,
       date: rowDate,
+      // Window-match a signature-keyed twin on the purchase/key date, which is
+      // stable pending<->settled even when the settled row re-dates to a later
+      // bank charge date.
+      matchDate: keyDate,
       payeeName: tx.description,
       notes: tx.memo ?? "",
     };
@@ -432,6 +434,7 @@ export class ActualBudgetStorage implements TransactionStorage {
         amount: e.amount,
         cleared: Boolean(e.cleared),
         notes: e.notes ?? null,
+        date: e.date, // for signature-key window matching
       }));
 
       const plan = planActualUpsert(incoming, existing, {
