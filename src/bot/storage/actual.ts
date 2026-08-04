@@ -20,6 +20,7 @@ import {
   type IncomingTx,
 } from "./actualUpsert.js";
 import { toJerusalemDate } from "./dates.js";
+import { anchorFxAmount, type FibiAuth } from "./fxAnchor.js";
 
 const logger = createLogger("ActualBudgetStorage");
 
@@ -28,6 +29,10 @@ export class ActualBudgetStorage implements TransactionStorage {
   private accountIdToNameMap = new Map<string, string>();
   private excludeRes?: RegExp[];
   private cardPendingRes?: RegExp[];
+  // Per-save FX-anchor overrides: an Isracard FX pending row -> the ILS amount
+  // (integer minor units) taken from FIBI's auth hold. Empty unless
+  // `anchorFxToFibi` is on. Keyed by identity so no other storage is affected.
+  private fxOverrides = new Map<TransactionRow, number>();
 
   constructor(private config: MoneymanConfig) {}
 
@@ -48,6 +53,13 @@ export class ActualBudgetStorage implements TransactionStorage {
     );
 
     try {
+      // Collect FIBI FX auth amounts from the FULL set BEFORE exclusions drop
+      // them (they stay excluded — used only as an amount source), then compute
+      // per-row overrides. Off by default -> empty map -> no behavior change.
+      this.fxOverrides = this.config.storage.actual?.anchorFxToFibi
+        ? this.computeFxAnchors(txns)
+        : new Map();
+
       const kept = this.applyDescriptionExclusions(txns, stats);
 
       if (this.config.storage.actual?.upsert) {
@@ -270,7 +282,7 @@ export class ActualBudgetStorage implements TransactionStorage {
     tx: TransactionRow,
     actualAccountId: string,
   ): ImportTransactionEntity {
-    const amount = actualApi.utils.amountToInteger(tx.chargedAmount);
+    const amount = this.actualAmount(tx);
 
     return {
       account: actualAccountId,
@@ -335,6 +347,85 @@ export class ActualBudgetStorage implements TransactionStorage {
     );
   }
 
+  /**
+   * A FIBI (beinleumi) FX auth hold — an excluded amount source for FX anchoring.
+   * Carries only the ILS `chargedAmount` + date (originalCurrency is "ILS", no
+   * merchant/identifier); description like "דירקט מטח אושר-ישרא".
+   */
+  private isFibiFxAuth(tx: TransactionRow): boolean {
+    return (
+      tx.companyId === CompanyTypes.beinleumi &&
+      tx.status === TransactionStatuses.Pending &&
+      /מטח אושר/.test(tx.description ?? "")
+    );
+  }
+
+  /**
+   * Build FX-anchor overrides (opt-in via `anchorFxToFibi`): pool the FIBI FX
+   * auth amounts (they stay excluded — used only as an amount source), then for
+   * each Isracard FX PENDING charge pick the best matching auth and record its
+   * ILS amount as the override. Consumable once each. `chargedAmount` is the only
+   * thing overridden; originalAmount/currency/merchant are untouched, so the
+   * FX-stable collapse key is unaffected. Settled charges are never anchored.
+   */
+  private computeFxAnchors(
+    txns: Array<TransactionRow>,
+  ): Map<TransactionRow, number> {
+    const overrides = new Map<TransactionRow, number>();
+    let pool: FibiAuth[] = txns
+      .filter((t) => this.isFibiFxAuth(t))
+      .map((t) => ({
+        amountMinor: actualApi.utils.amountToInteger(t.chargedAmount),
+        date: toJerusalemDate(t.date),
+      }));
+    if (pool.length === 0) return overrides;
+
+    for (const tx of txns) {
+      if (tx.status !== TransactionStatuses.Pending) continue;
+      if (tx.companyId !== CompanyTypes.isracard) continue;
+      if (!tx.originalCurrency || tx.originalCurrency === "ILS") continue; // FX only
+
+      const isracardMinor = actualApi.utils.amountToInteger(tx.chargedAmount);
+      const res = anchorFxAmount(
+        {
+          originalCurrency: tx.originalCurrency,
+          chargedAmount: tx.chargedAmount,
+          matchDate: toJerusalemDate(tx.date),
+        },
+        pool,
+      );
+
+      // One observability line per FX decision — a running dataset to confirm
+      // (or refute) the ~4% FIBI/Isracard FX spread hypothesis.
+      const ils = (m: number) => (Math.abs(m) / 100).toFixed(2);
+      const parts = [
+        `fx anchor: ${tx.description}`,
+        `${Math.abs(tx.originalAmount).toFixed(2)} ${tx.originalCurrency}`,
+        `isracard=₪${ils(isracardMinor)}`,
+      ];
+      if (res.candidateMinor !== null && res.ratio !== null) {
+        parts.push(`fibi=₪${ils(res.candidateMinor)}`);
+        parts.push(`ratio=${res.ratio.toFixed(4)}`);
+      }
+      parts.push(`-> ${res.outcome}`);
+      logger(parts.join(" "));
+
+      if (res.consumedIndex !== null) {
+        overrides.set(tx, res.amountMinor);
+        pool = pool.filter((_, i) => i !== res.consumedIndex);
+      }
+    }
+    return overrides;
+  }
+
+  /** The ILS amount to import (minor units), applying an FX anchor override. */
+  private actualAmount(tx: TransactionRow): number {
+    return (
+      this.fxOverrides.get(tx) ??
+      actualApi.utils.amountToInteger(tx.chargedAmount)
+    );
+  }
+
   private toIncoming(tx: TransactionRow): IncomingTx {
     const isPending = tx.status === TransactionStatuses.Pending;
     // `isCardKey` decides the MATCH key (unchanged); `isCardCharge` decides
@@ -382,7 +473,7 @@ export class ActualBudgetStorage implements TransactionStorage {
         ? cardChargeDate
         : keyDate;
 
-    const amount = actualApi.utils.amountToInteger(tx.chargedAmount);
+    const amount = this.actualAmount(tx);
     const baseKey = isCardKey
       ? computeCardKey({ date: keyDate, amountMinor: amount })
       : computeStableKey({

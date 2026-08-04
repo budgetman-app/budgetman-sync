@@ -67,6 +67,17 @@ export const ActualSchema = z.object({
   // NOT the bank charge date — see docs/impl-notes-card-lifecycle.md). Requires
   // upsert. Default off leaves the purchase-date/clear-on-complete behavior.
   clearOnChargeDate: z.boolean().default(false),
+  // anchorFxToFibi (budgetman): make an Isracard FX PENDING charge's provisional
+  // ILS amount match FIBI's current auth-hold ILS, so Actual's working balance
+  // tracks FIBI's current balance during reconciliation. Both sides' ILS is a
+  // provisional estimate that re-quotes until settlement; we deliberately follow
+  // FIBI's number each scrape. FIBI's excluded auth rows ("דירקט מטח אושר-ישרא")
+  // are used ONLY as an amount source (never imported). Matched by date window +
+  // amount; only the ILS `chargedAmount` is overridden — originalAmount/currency/
+  // merchant are untouched, so the FX-stable pending->settled collapse is
+  // unaffected. A settled (non-pending) charge is never anchored (it already
+  // carries the final ILS, which equals FIBI's settled). Default off = no-op.
+  anchorFxToFibi: z.boolean().default(false),
   // excludeDescriptions: case-insensitive regular expressions; a transaction
   // whose description matches any of them is dropped before import. Needed when
   // a card and the checking account it settles against both map to the same

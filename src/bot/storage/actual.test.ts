@@ -475,6 +475,109 @@ describe("card lifecycle end-to-end: Isracard pending(named) -> FIBI charge date
   });
 });
 
+describe("ActualBudgetStorage anchorFxToFibi", () => {
+  beforeEach(() => resetStore());
+
+  // FIBI's excluded FX auth hold (amount source only): beinleumi + pending +
+  // "מטח אושר", ILS-only, on the checking account.
+  const fibiFxAuth = (over: Partial<TransactionRow> = {}) =>
+    row({
+      account: "477872",
+      companyId: "beinleumi" as TransactionRow["companyId"],
+      description: "דירקט מטח אושר-ישרא",
+      originalCurrency: "ILS",
+      originalAmount: -63.58,
+      chargedAmount: -63.58, // FIBI's re-quoted ILS
+      status: TransactionStatuses.Pending,
+      uniqueId: "fibi-fx",
+      ...over,
+    });
+  // Isracard FX pending charge: €20, Isracard's provisional ₪61.14.
+  const isracardFx = (over: Partial<TransactionRow> = {}) =>
+    row({
+      account: "0041",
+      description: "UPSTASH",
+      originalAmount: -20,
+      originalCurrency: "EUR",
+      chargedAmount: -61.14,
+      status: TransactionStatuses.Pending,
+      uniqueId: "isr-fx-p",
+      ...over,
+    });
+
+  const cfg = {
+    anchorFxToFibi: true,
+    excludeDescriptions: ["מטח אושר"], // FIBI auth is source-only, never imported
+  };
+
+  it("overrides the Isracard FX pending ILS with FIBI's auth amount, name/original untouched", async () => {
+    await save([fibiFxAuth(), isracardFx()], cfg);
+    const rows = storeOf();
+    expect(rows).toHaveLength(1); // FIBI auth excluded, only the Isracard row imported
+    expect(rows[0].payee_name).toBe("UPSTASH"); // merchant unchanged
+    expect(rows[0].amount).toBe(-6358); // ILS anchored to FIBI (was -6114)
+    expect(rows[0].cleared).toBe(false);
+  });
+
+  it("(d) flag off: keeps Isracard's provisional ILS", async () => {
+    await save([fibiFxAuth(), isracardFx()], {
+      excludeDescriptions: ["מטח אושר"], // still exclude the auth, just don't anchor
+    });
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].amount).toBe(-6114); // unchanged Isracard estimate
+  });
+
+  it("(e) a settled (non-pending) FX charge is never anchored", async () => {
+    // Even with a FIBI auth present, the completed charge takes Isracard's final
+    // ILS (which equals FIBI's settled), not the auth's re-quote.
+    await save(
+      [
+        fibiFxAuth(),
+        isracardFx({
+          status: TransactionStatuses.Completed,
+          chargedAmount: -59.2,
+          identifier: "V",
+          uniqueId: "isr-fx-s",
+        }),
+      ],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].amount).toBe(-5920); // Isracard final, not FIBI's -6358
+  });
+
+  it("(f) anchored pending still collapses onto the settled €20 twin (no dupe)", async () => {
+    // 1) FX pending anchored to FIBI's ₪63.58
+    await save([fibiFxAuth(), isracardFx()], cfg);
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].amount).toBe(-6358);
+    rows[0].category = "cat-travel";
+
+    // 2) it settles at Isracard's final ₪59.20 (auth gone) -> collapse via the
+    //    FX-stable key (originalAmount €20 + EUR + account), one row.
+    await save(
+      [
+        isracardFx({
+          status: TransactionStatuses.Completed,
+          chargedAmount: -59.2,
+          identifier: "V",
+          uniqueId: "isr-fx-s",
+        }),
+      ],
+      cfg,
+    );
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // no duplicate
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].amount).toBe(-5920); // final settled ILS
+    expect(rows[0].category).toBe("cat-travel"); // preserved
+  });
+});
+
 describe("ActualBudgetStorage excludeDescriptions", () => {
   beforeEach(() => resetStore());
 
