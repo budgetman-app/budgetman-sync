@@ -246,6 +246,91 @@ describe("planActualUpsert", () => {
     expect(updates).toHaveLength(0);
   });
 
+  it("(stuck-row a) finalizes a row imported UNCLEARED under the settled id: cleared+date only", () => {
+    // A card charge imported uncleared under an id that equals its later
+    // settledImportedId used to hit `continue` forever and never clear.
+    const existing = [
+      {
+        id: "r",
+        imported_id: SETTLED_ID,
+        amount: -5131,
+        cleared: false,
+        notes: "keep me",
+        date: "2026-08-20", // future monthly placeholder it got stuck on
+      },
+    ];
+    const { adds, updates } = planActualUpsert(
+      [settled({ amount: -5131, date: "2026-08-04" })], // real charge date
+      existing,
+      { updateDateOnSettle: true },
+    );
+    expect(adds).toHaveLength(0);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].id).toBe("r");
+    expect(updates[0].fields).toEqual({ cleared: true, date: "2026-08-04" });
+    // amount/notes/imported_id/category are left untouched
+    expect("amount" in updates[0].fields).toBe(false);
+    expect("notes" in updates[0].fields).toBe(false);
+    expect("imported_id" in updates[0].fields).toBe(false);
+    expect("category" in updates[0].fields).toBe(false);
+  });
+
+  it("(stuck-row b) no-op once the row is cleared and on the charge date", () => {
+    const existing = [
+      {
+        id: "r",
+        imported_id: SETTLED_ID,
+        amount: -5131,
+        cleared: true,
+        notes: "",
+        date: "2026-08-04",
+      },
+    ];
+    const { adds, updates } = planActualUpsert(
+      [settled({ amount: -5131, date: "2026-08-04" })],
+      existing,
+      { updateDateOnSettle: true },
+    );
+    expect(adds).toHaveLength(0);
+    expect(updates).toHaveLength(0);
+  });
+
+  it("(stuck-row c) clears but does NOT move the date when updateDateOnSettle is off", () => {
+    const existing = [
+      {
+        id: "r",
+        imported_id: SETTLED_ID,
+        amount: -5131,
+        cleared: false,
+        notes: "",
+        date: "2026-08-20",
+      },
+    ];
+    const { adds, updates } = planActualUpsert(
+      [settled({ amount: -5131, date: "2026-08-04" })],
+      existing,
+    );
+    expect(adds).toHaveLength(0);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].fields).toEqual({ cleared: true });
+    expect("date" in updates[0].fields).toBe(false);
+  });
+
+  it("(stuck-row d) unchanged when no row has that settled id (still matches a pending twin)", () => {
+    const existing = [existingPending({ amount: -5131 })]; // imported_id BASE, not SETTLED_ID
+    const { adds, updates } = planActualUpsert(
+      [settled({ amount: -5131 })],
+      existing,
+    );
+    expect(adds).toHaveLength(0);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].id).toBe("row1");
+    expect(updates[0].fields).toMatchObject({
+      cleared: true,
+      imported_id: SETTLED_ID,
+    });
+  });
+
   it("does nothing when a pending charge re-appears unchanged", () => {
     const { adds, updates } = planActualUpsert(
       [pending({ amount: -6004 })],

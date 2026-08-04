@@ -314,7 +314,24 @@ export function planActualUpsert(
       }
     } else {
       // settled
-      if (byImportedId.has(tx.settledImportedId)) continue; // already imported -> no-op
+      const prior = byImportedId.get(tx.settledImportedId);
+      if (prior) {
+        // A row already exists under this settled id. If it is genuinely
+        // finalized (cleared, and on the settled date when we manage dates), it
+        // is a true no-op. Otherwise it was imported UNCLEARED (or on the wrong
+        // date) under an id that equals this settledImportedId and got stuck —
+        // finalize it IN PLACE: flip cleared (and fix the date under
+        // updateDateOnSettle) without touching amount/category/notes/imported_id.
+        const dateOk = !options.updateDateOnSettle || prior.date === tx.date;
+        if (prior.cleared && dateOk) continue; // already correct -> no-op
+        const fields: PlannedUpdate["fields"] = { cleared: true };
+        if (options.updateDateOnSettle && prior.date !== tx.date) {
+          fields.date = tx.date;
+        }
+        updates.push({ id: prior.id, fields });
+        report.push(`cleared stuck row: ${tx.payeeName} ₪${ils(tx.amount)}`);
+        continue;
+      }
       const twin = findTwin(tx.baseKey, matchDate);
       if (twin) {
         consumed.add(twin.id);
