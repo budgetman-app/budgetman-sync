@@ -57,6 +57,7 @@ jest.mock("@actual-app/api", () => {
 import * as actualApi from "@actual-app/api";
 import { ActualBudgetStorage } from "./actual.js";
 import { matchChargeDatesToGranular } from "../../scraper/cardChargeDates.js";
+import { toJerusalemDate } from "./dates.js";
 
 const storeOf = () => (actualApi as any).__store() as any[];
 const resetStore = () => (actualApi as any).__reset();
@@ -306,6 +307,110 @@ describe("ActualBudgetStorage clearOnChargeDate (card lifecycle, #14)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].cleared).toBe(true);
     expect(rows[0].date).toBe("2026-07-03"); // purchase date (UTC path, unchanged)
+  });
+});
+
+describe("ActualBudgetStorage clearOnChargeDate future-charge guard (#14)", () => {
+  beforeEach(() => resetStore());
+
+  // Relative dates so the future/past split stays valid over time. Margins are
+  // wide enough (>=2 days) to avoid TZ-midnight edge flakiness.
+  const DAY = 86_400_000;
+  const isoOffset = (days: number) =>
+    new Date(Date.now() + days * DAY).toISOString();
+  const cfg = { clearOnChargeDate: true };
+
+  const cardCharge = (over: Partial<TransactionRow>) =>
+    row({
+      description: "טעינות-חבר של קבע",
+      originalAmount: -692,
+      originalCurrency: "ILS",
+      chargedAmount: -692,
+      status: TransactionStatuses.Completed,
+      ...over,
+    });
+
+  it("(a) future charge date -> uncleared, dated on the purchase date, PENDING note", async () => {
+    const purchase = isoOffset(-20);
+    await save(
+      [
+        cardCharge({
+          date: purchase,
+          processedDate: isoOffset(16), // future monthly placeholder
+          uniqueId: "future",
+        }),
+      ],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false); // NOT prematurely cleared
+    expect(rows[0].date).toBe(toJerusalemDate(purchase)); // purchase, not the future date
+    expect(rows[0].notes).toBe("PENDING");
+  });
+
+  it("(b) past charge date -> cleared on the real charge date", async () => {
+    const purchase = isoOffset(-20);
+    const charge = isoOffset(-4);
+    await save(
+      [cardCharge({ date: purchase, processedDate: charge, uniqueId: "past" })],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].date).toBe(toJerusalemDate(charge));
+  });
+
+  it("(c) collapses onto the settled twin once charged: one row, cleared, real date, category kept", async () => {
+    const purchase = isoOffset(-20);
+    const base = {
+      description: "Upapp",
+      originalAmount: -25,
+      originalCurrency: "ILS",
+      chargedAmount: -25,
+      date: purchase,
+    } as Partial<TransactionRow>;
+
+    // Day 1: FIBI still holds it -> future monthly placeholder -> uncleared.
+    await save(
+      [cardCharge({ ...base, processedDate: isoOffset(16), uniqueId: "c1" })],
+      cfg,
+    );
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false);
+    rows[0].category = "cat-x"; // human categorizes the pending placeholder
+
+    // Later: FIBI posted -> enrichment stamped the real (past) charge date.
+    const charge = isoOffset(-2);
+    await save(
+      [cardCharge({ ...base, processedDate: charge, uniqueId: "c2" })],
+      cfg,
+    );
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // collapsed, no duplicate
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].date).toBe(toJerusalemDate(charge));
+    expect(rows[0].category).toBe("cat-x");
+  });
+
+  it("(d) default-off: a future-dated completed card charge is unaffected", async () => {
+    const purchase = isoOffset(-20);
+    await save(
+      [
+        cardCharge({
+          date: purchase,
+          processedDate: isoOffset(16),
+          uniqueId: "d",
+        }),
+      ],
+      {}, // clearOnChargeDate not set
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true); // upstream behavior: completed -> cleared
+    expect(rows[0].date).toBe(new Date(purchase).toISOString().split("T")[0]);
   });
 });
 

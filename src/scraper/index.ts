@@ -196,8 +196,13 @@ async function mergeIsracardPending(
   }
 
   try {
-    const pendingByAccount =
-      await fetchIsracardPendingByAccount(browserContext);
+    // The SPA only auto-loads its primary card; pass every card suffix from the
+    // settled scrape so pending on the non-primary cards (e.g. 0041) is queried.
+    const cards = (result.accounts ?? []).map((a) => a.accountNumber);
+    const pendingByAccount = await fetchIsracardPendingByAccount(
+      browserContext,
+      cards,
+    );
     let merged = 0;
     for (const acc of result.accounts ?? []) {
       const pending = pendingByAccount.get(acc.accountNumber);

@@ -353,13 +353,33 @@ export class ActualBudgetStorage implements TransactionStorage {
       ? toJerusalemDate(tx.date)
       : new Date(tx.date).toISOString().split("T")[0];
 
-    // The Actual ROW date. A settled domestic card charge is dated on its real
-    // bank charge date (processedDate — set by the FIBI drill-down / Isracard
-    // "מחוץ למועד" enrichment) so cleared rows reconstruct FIBI's running
-    // balance. Pending rows stay on the purchase date (uncleared).
-    const rowDate =
+    // For a COMPLETED card charge under clearOnChargeDate, its effective charge
+    // date is processedDate — set to the real (past) bank charge date when the
+    // FIBI drill-down enrichment matched it, else still the FUTURE monthly-
+    // statement placeholder the scraper reports.
+    const cardChargeDate =
       clearOnChargeDate && this.isCardCharge(tx) && !isPending
         ? toJerusalemDate(tx.processedDate ?? tx.date)
+        : undefined;
+
+    // A charge whose effective charge date is still in the future has not been
+    // charged yet (FIBI holds it as a pending auth). Importing it cleared on that
+    // future date is the premature-clear bug. Treat it as pending: uncleared, on
+    // the purchase date — it collapses onto the real settled row later (signature
+    // key) and clears on the true FIBI charge date once that date is <= today.
+    const chargeInFuture =
+      cardChargeDate !== undefined &&
+      cardChargeDate > toJerusalemDate(new Date());
+
+    const effectivePending = isPending || chargeInFuture;
+
+    // The Actual ROW date. A settled domestic card charge that has actually been
+    // charged (charge date <= today) is dated on that real bank charge date so
+    // cleared rows reconstruct FIBI's running balance; everything else (pending,
+    // or a not-yet-charged future card charge) stays on the purchase date.
+    const rowDate =
+      cardChargeDate !== undefined && !chargeInFuture
+        ? cardChargeDate
         : keyDate;
 
     const amount = actualApi.utils.amountToInteger(tx.chargedAmount);
@@ -373,7 +393,7 @@ export class ActualBudgetStorage implements TransactionStorage {
     return {
       baseKey,
       settledImportedId: this.settledImportedId(tx),
-      isPending,
+      isPending: effectivePending,
       amount,
       date: rowDate,
       // Window-match a signature-keyed twin on the purchase/key date, which is
