@@ -1,4 +1,4 @@
-import { anchorFxAmount, type FibiAuth } from "./fxAnchor.js";
+import { anchorFxAmount, assignFxAnchors, type FibiAuth } from "./fxAnchor.js";
 
 // Isracard's provisional ILS for a €20 charge, purchased 2026-07-03.
 const fxIncoming = {
@@ -95,5 +95,86 @@ describe("anchorFxAmount", () => {
     const res = anchorFxAmount(fxIncoming, auths);
     expect(res.consumedIndex).toBe(1);
     expect(res.amountMinor).toBe(-6228);
+  });
+});
+
+describe("assignFxAnchors (global best-pair)", () => {
+  // The live regression: a single ₪63.58 FIBI hold sits within tolerance of BOTH
+  // Google (₪57.58, 10.4%) and Upstash (₪61.21, 3.9%). Per-charge greedy in list
+  // order let Google (seen first) grab it; the hold actually belongs to Upstash.
+  const google = {
+    originalCurrency: "EUR",
+    chargedAmount: -57.58,
+    matchDate: "2026-08-01",
+  };
+  const upstash = {
+    originalCurrency: "USD",
+    chargedAmount: -61.21,
+    matchDate: "2026-08-03",
+  };
+
+  it("assigns the shared ₪63.58 hold to the nearer charge (Upstash), not the first-listed (Google)", () => {
+    const auths: FibiAuth[] = [
+      { amountMinor: 340, date: "2026-08-02" },
+      { amountMinor: -340, date: "2026-08-02" },
+      { amountMinor: -6358, date: "2026-08-03" }, // the contested hold
+    ];
+    const [g, u] = assignFxAnchors([google, upstash], auths);
+    // Upstash wins the ₪63.58 hold (in-band 1.039, nearest).
+    expect(u.amountMinor).toBe(-6358);
+    expect(u.outcome).toBe("anchored");
+    // Google gets nothing (its real auth already released on settlement).
+    expect(g.consumedAuthIndex).toBeNull();
+    expect(g.amountMinor).toBe(-5758); // keeps Isracard's settled amount
+  });
+
+  it("is order-independent — Upstash still wins when it is listed first", () => {
+    const auths: FibiAuth[] = [{ amountMinor: -6358, date: "2026-08-03" }];
+    const [u, g] = assignFxAnchors([upstash, google], auths);
+    expect(u.amountMinor).toBe(-6358);
+    expect(g.consumedAuthIndex).toBeNull();
+  });
+
+  it("never assigns one hold to two charges", () => {
+    const auths: FibiAuth[] = [{ amountMinor: -6358, date: "2026-08-03" }];
+    const res = assignFxAnchors([google, upstash], auths);
+    const consumed = res
+      .map((r) => r.consumedAuthIndex)
+      .filter((i) => i !== null);
+    expect(consumed).toEqual([...new Set(consumed)]); // no duplicate index
+    expect(consumed).toHaveLength(1);
+  });
+
+  it("gives each charge its own hold when both are genuinely in flight", () => {
+    const auths: FibiAuth[] = [
+      { amountMinor: -6358, date: "2026-08-03" }, // Upstash
+      { amountMinor: -5990, date: "2026-08-01" }, // Google, ratio 1.040 in-band
+    ];
+    const [g, u] = assignFxAnchors([google, upstash], auths);
+    expect(u.amountMinor).toBe(-6358);
+    expect(g.amountMinor).toBe(-5990);
+  });
+
+  it("leaves an ILS (domestic) charge untouched", () => {
+    const ils = {
+      originalCurrency: "ILS",
+      chargedAmount: -100,
+      matchDate: "2026-08-03",
+    };
+    const [r] = assignFxAnchors(
+      [ils],
+      [{ amountMinor: -10500, date: "2026-08-03" }],
+    );
+    expect(r.outcome).toBe("not-fx");
+    expect(r.consumedAuthIndex).toBeNull();
+  });
+
+  it("skips a charge with no in-window hold", () => {
+    const [r] = assignFxAnchors(
+      [upstash],
+      [{ amountMinor: -6358, date: "2026-07-01" }],
+    );
+    expect(r.outcome).toBe("no-candidate");
+    expect(r.amountMinor).toBe(-6121);
   });
 });

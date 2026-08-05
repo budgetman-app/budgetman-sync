@@ -20,7 +20,7 @@ import {
   type IncomingTx,
 } from "./actualUpsert.js";
 import { toJerusalemDate } from "./dates.js";
-import { anchorFxAmount, type FibiAuth } from "./fxAnchor.js";
+import { assignFxAnchors, type FibiAuth } from "./fxAnchor.js";
 
 const logger = createLogger("ActualBudgetStorage");
 
@@ -397,7 +397,7 @@ export class ActualBudgetStorage implements TransactionStorage {
     txns: Array<TransactionRow>,
   ): Map<TransactionRow, number> {
     const overrides = new Map<TransactionRow, number>();
-    let pool: FibiAuth[] = txns
+    const pool: FibiAuth[] = txns
       .filter((t) => this.isFibiFxAuth(t))
       .map((t) => ({
         amountMinor: actualApi.utils.amountToInteger(t.chargedAmount),
@@ -407,27 +407,32 @@ export class ActualBudgetStorage implements TransactionStorage {
 
     const upsert = Boolean(this.config.storage.actual?.upsert);
 
-    for (const tx of txns) {
-      if (tx.companyId !== CompanyTypes.isracard) continue;
-      if (!tx.originalCurrency || tx.originalCurrency === "ILS") continue; // FX only
-      const isPending = tx.status === TransactionStatuses.Pending;
-      if (!isPending && !upsert) continue; // completed FX anchoring needs upsert
+    // Eligible FX charges: Isracard, non-ILS, and either pending or (completed
+    // only when upsert can later collapse it to settled).
+    const eligible = txns.filter(
+      (tx) =>
+        tx.companyId === CompanyTypes.isracard &&
+        tx.originalCurrency &&
+        tx.originalCurrency !== "ILS" &&
+        (tx.status === TransactionStatuses.Pending || upsert),
+    );
 
-      const isracardMinor = actualApi.utils.amountToInteger(tx.chargedAmount);
-      const res = anchorFxAmount(
-        {
-          originalCurrency: tx.originalCurrency,
-          chargedAmount: tx.chargedAmount,
-          matchDate: toJerusalemDate(tx.date),
-        },
-        pool,
-      );
+    // Assign holds to charges GLOBALLY (best-pair), not charge-by-charge in list
+    // order — otherwise the first FX charge grabs a hold that fits a later one
+    // better (the Google/Upstash ₪63.58 mis-assignment).
+    const results = assignFxAnchors(
+      eligible.map((tx) => ({
+        originalCurrency: tx.originalCurrency!,
+        chargedAmount: tx.chargedAmount,
+        matchDate: toJerusalemDate(tx.date),
+      })),
+      pool,
+    );
 
-      const anchored = res.consumedIndex !== null;
-      if (anchored) {
-        overrides.set(tx, res.amountMinor);
-        pool = pool.filter((_, i) => i !== res.consumedIndex);
-      }
+    eligible.forEach((tx, i) => {
+      const res = results[i];
+      const anchored = res.consumedAuthIndex !== null;
+      if (anchored) overrides.set(tx, res.amountMinor);
 
       // One observability line per FX decision — a running dataset to confirm
       // (or refute) the ~4% FIBI/Isracard FX spread hypothesis, and to show the
@@ -435,13 +440,13 @@ export class ActualBudgetStorage implements TransactionStorage {
       const ils = (m: number) => (Math.abs(m) / 100).toFixed(2);
       const state = anchored
         ? "anchored (fibi still holding, kept pending)"
-        : isPending
+        : tx.status === TransactionStatuses.Pending
           ? "unanchored (kept isracard pending)"
           : "settled (fibi posted)";
       const parts = [
         `fx anchor: ${tx.description}`,
         `${Math.abs(tx.originalAmount).toFixed(2)} ${tx.originalCurrency}`,
-        `isracard=₪${ils(isracardMinor)}`,
+        `isracard=₪${ils(actualApi.utils.amountToInteger(tx.chargedAmount))}`,
       ];
       if (res.candidateMinor !== null && res.ratio !== null) {
         parts.push(`fibi=₪${ils(res.candidateMinor)}`);
@@ -449,7 +454,7 @@ export class ActualBudgetStorage implements TransactionStorage {
       }
       parts.push(`-> ${state}`);
       logger(parts.join(" "));
-    }
+    });
     return overrides;
   }
 
