@@ -519,7 +519,7 @@ describe("ActualBudgetStorage anchorFxToFibi", () => {
     expect(rows[0].cleared).toBe(false);
   });
 
-  it("(d) flag off: keeps Isracard's provisional ILS", async () => {
+  it("flag off (pending FX): keeps Isracard's provisional ILS", async () => {
     await save([fibiFxAuth(), isracardFx()], {
       excludeDescriptions: ["מטח אושר"], // still exclude the auth, just don't anchor
     });
@@ -528,15 +528,37 @@ describe("ActualBudgetStorage anchorFxToFibi", () => {
     expect(rows[0].amount).toBe(-6114); // unchanged Isracard estimate
   });
 
-  it("(e) a settled (non-pending) FX charge is never anchored", async () => {
-    // Even with a FIBI auth present, the completed charge takes Isracard's final
-    // ILS (which equals FIBI's settled), not the auth's re-quote.
+  it("(a) COMPLETED FX + FIBI still holding -> kept UNCLEARED at FIBI's hold amount", async () => {
+    // Isracard has settled (₪61.14) but FIBI is still holding the auth (₪63.58);
+    // match FIBI and keep it pending until FIBI posts it.
     await save(
       [
         fibiFxAuth(),
         isracardFx({
           status: TransactionStatuses.Completed,
-          chargedAmount: -59.2,
+          chargedAmount: -61.14,
+          identifier: "V",
+          uniqueId: "isr-fx-s",
+        }),
+      ],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false); // kept pending — FIBI still holds it
+    expect(rows[0].amount).toBe(-6358); // FIBI's hold amount, not Isracard's -6114
+    expect(rows[0].notes).toBe("PENDING");
+    expect(rows[0].imported_id.startsWith("pend:sig_")).toBe(true);
+    expect(rows[0].payee_name).toBe("UPSTASH"); // merchant untouched
+  });
+
+  it("(b) COMPLETED FX + NO matching FIBI auth -> clears at Isracard's settled amount", async () => {
+    // No FIBI auth present (posted / never held) -> today's behavior.
+    await save(
+      [
+        isracardFx({
+          status: TransactionStatuses.Completed,
+          chargedAmount: -61.14,
           identifier: "V",
           uniqueId: "isr-fx-s",
         }),
@@ -546,7 +568,87 @@ describe("ActualBudgetStorage anchorFxToFibi", () => {
     const rows = storeOf();
     expect(rows).toHaveLength(1);
     expect(rows[0].cleared).toBe(true);
-    expect(rows[0].amount).toBe(-5920); // Isracard final, not FIBI's -6358
+    expect(rows[0].amount).toBe(-6114); // Isracard settled
+  });
+
+  it("(c) transition: FIBI-held completed FX then FIBI posts -> one row flips to cleared, no dupe", async () => {
+    // Run 1: Isracard settled but FIBI still holding -> uncleared at ₪63.58.
+    await save(
+      [
+        fibiFxAuth(),
+        isracardFx({
+          status: TransactionStatuses.Completed,
+          chargedAmount: -61.14,
+          identifier: "V",
+          uniqueId: "isr-fx-s1",
+        }),
+      ],
+      cfg,
+    );
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false);
+    expect(rows[0].amount).toBe(-6358);
+    rows[0].category = "cat-travel";
+
+    // Run 2: FIBI has posted it (auth gone) -> settles at Isracard's ₪61.14,
+    // collapses the kept-pending row via the pend:sig_ key.
+    await save(
+      [
+        isracardFx({
+          status: TransactionStatuses.Completed,
+          chargedAmount: -61.14,
+          identifier: "V",
+          uniqueId: "isr-fx-s2",
+        }),
+      ],
+      cfg,
+    );
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // no duplicate
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].amount).toBe(-6114); // true settled amount
+    expect(rows[0].category).toBe("cat-travel"); // preserved
+  });
+
+  it("(d) domestic Completed charge is unaffected (not FX)", async () => {
+    await save(
+      [
+        fibiFxAuth(),
+        isracardFx({
+          originalCurrency: "ILS",
+          originalAmount: -130,
+          chargedAmount: -130,
+          status: TransactionStatuses.Completed,
+          identifier: "V",
+          uniqueId: "dom",
+        }),
+      ],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true); // domestic completed clears normally
+    expect(rows[0].amount).toBe(-13000);
+  });
+
+  it("(e) flag off: a FIBI-held completed FX clears at Isracard's amount", async () => {
+    await save(
+      [
+        fibiFxAuth(),
+        isracardFx({
+          status: TransactionStatuses.Completed,
+          chargedAmount: -61.14,
+          identifier: "V",
+          uniqueId: "isr-fx-s",
+        }),
+      ],
+      { excludeDescriptions: ["מטח אושר"] }, // anchorFxToFibi off
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].amount).toBe(-6114);
   });
 
   it("(f) anchored pending still collapses onto the settled €20 twin (no dupe)", async () => {
@@ -575,6 +677,137 @@ describe("ActualBudgetStorage anchorFxToFibi", () => {
     expect(rows[0].cleared).toBe(true);
     expect(rows[0].amount).toBe(-5920); // final settled ILS
     expect(rows[0].category).toBe("cat-travel"); // preserved
+  });
+});
+
+describe("ActualBudgetStorage clearOnFibiSettlement", () => {
+  beforeEach(() => resetStore());
+
+  const cfg = { clearOnFibiSettlement: true };
+
+  // Relative dates so the "older than the settle lag" boundary stays valid over
+  // time. RECENT (< FIBI_SETTLE_LAG_DAYS) stays uncleared while unmatched; OLD
+  // (>= lag) clears via the time-lag fallback.
+  const DAY = 86_400_000;
+  const isoOffset = (days: number) =>
+    new Date(Date.now() + days * DAY).toISOString();
+  const RECENT = isoOffset(-1); // < 5-day lag
+  const OLD = isoOffset(-10); // >= 5-day lag
+  const CHARGE = isoOffset(-3); // a past FIBI charge date
+
+  // A domestic Isracard card charge (isCardCharge via companyId). Default
+  // processedDate is the FUTURE monthly placeholder the scraper reports.
+  const cardTx = (over: Partial<TransactionRow>) =>
+    row({
+      description: "Upapp",
+      originalCurrency: "ILS",
+      originalAmount: -100,
+      chargedAmount: -100,
+      status: TransactionStatuses.Completed,
+      date: RECENT,
+      processedDate: isoOffset(15),
+      ...over,
+    });
+
+  it("(a) bank-settled granular clears on the FIBI charge date, regardless of age", async () => {
+    // RECENT purchase: without the mark it would stay pending, but bankSettled
+    // clears it precisely on the FIBI charge date.
+    await save(
+      [cardTx({ bankSettled: true, processedDate: CHARGE, uniqueId: "a" })],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].date).toBe(toJerusalemDate(CHARGE)); // FIBI charge date
+  });
+
+  it("(b) unmatched RECENT granular stays uncleared on the purchase date at Isracard's amount", async () => {
+    await save([cardTx({ uniqueId: "b" })], cfg); // no bankSettled mark, recent
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false); // FIBI hasn't posted it yet
+    expect(rows[0].date).toBe(toJerusalemDate(RECENT)); // purchase date
+    expect(rows[0].notes).toBe("PENDING");
+    expect(rows[0].amount).toBe(-10000); // Isracard's own amount
+  });
+
+  it("(lag) unmatched card charge OLDER than the settle lag clears on the purchase date", async () => {
+    await save([cardTx({ date: OLD, uniqueId: "lag" })], cfg); // unmatched, old
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true); // FIBI has certainly posted it by now
+    expect(rows[0].date).toBe(toJerusalemDate(OLD)); // dated on the purchase date
+  });
+
+  it("(c) unmatched RECENT -> matched next run flips to cleared: single row, no dupe", async () => {
+    await save([cardTx({ uniqueId: "c" })], cfg); // unmatched recent -> uncleared
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false);
+    rows[0].category = "cat-x";
+
+    // Next run: FIBI posted it -> enrichment marks it bank-settled with the real
+    // charge date; collapses via the pend:sig_ key.
+    await save(
+      [cardTx({ bankSettled: true, processedDate: CHARGE, uniqueId: "c" })],
+      cfg,
+    );
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // no duplicate
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].date).toBe(toJerusalemDate(CHARGE));
+    expect(rows[0].category).toBe("cat-x");
+  });
+
+  it("(d) an already-cleared row stays cleared when a later run reports it unmatched (idempotent)", async () => {
+    // Run 1: matched -> cleared, imported under its settledImportedId.
+    await save(
+      [cardTx({ bankSettled: true, processedDate: CHARGE, uniqueId: "d" })],
+      cfg,
+    );
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    const importedId = rows[0].imported_id;
+
+    // Run 2: same charge, RECENT + now UNMATCHED (window didn't re-drill) -> the
+    // pending path must not thrash it back to uncleared / duplicate it.
+    await save([cardTx({ uniqueId: "d" })], cfg);
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // no duplicate
+    expect(rows[0].cleared).toBe(true); // stays cleared (posted stays posted)
+    expect(rows[0].imported_id).toBe(importedId);
+  });
+
+  it("(e) flag off: a completed card charge clears normally on the purchase date", async () => {
+    await save([cardTx({ bankSettled: true, uniqueId: "e" })], {}); // flag off
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    // upstream path: completed -> cleared, dated (UTC) on the purchase date
+    expect(rows[0].date).toBe(new Date(RECENT).toISOString().split("T")[0]);
+  });
+
+  it("(e) non-card completed charge is unaffected by the flag", async () => {
+    await save(
+      [
+        row({
+          account: "477872",
+          companyId: "beinleumi" as TransactionRow["companyId"],
+          description: "משכורת",
+          originalCurrency: "ILS",
+          originalAmount: 5000,
+          chargedAmount: 5000,
+          status: TransactionStatuses.Completed,
+          uniqueId: "sal",
+        }),
+      ],
+      { clearOnFibiSettlement: true, accounts: { "477872": "act-1" } },
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true); // non-card clears normally
   });
 });
 

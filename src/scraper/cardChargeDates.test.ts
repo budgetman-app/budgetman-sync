@@ -1,5 +1,6 @@
 import {
   matchChargeDatesToGranular,
+  merchantsMatch,
   normalizeMerchant,
   settlementRefFromDebit,
   isIsracardSettlementDebit,
@@ -40,20 +41,69 @@ function expense(over: Partial<FibiCardExpense>): FibiCardExpense {
 }
 
 describe("normalizeMerchant", () => {
-  it("collapses whitespace, trims, and lower-cases", () => {
-    expect(normalizeMerchant("  ANTHROPIC*CLAUDE  ")).toBe("anthropic*claude");
-    expect(normalizeMerchant('חנות הדוגמה בע"מ ')).toBe('חנות הדוגמה בע"מ');
+  it("collapses whitespace + punctuation, trims, and lower-cases", () => {
+    expect(normalizeMerchant("  ANTHROPIC*CLAUDE  ")).toBe("anthropic claude");
+  });
+
+  it("folds punctuation so the two Isracard renderings of LIME agree", () => {
+    // Drill-down uses '*', some granular use a space — same merchant.
+    expect(normalizeMerchant("LIME*2 RIDES RUUL")).toBe("lime 2 rides ruul");
+    expect(normalizeMerchant("LIME 2 RIDES RUUL")).toBe("lime 2 rides ruul");
+    expect(normalizeMerchant("LIME*2 RIDES RUUL")).toBe(
+      normalizeMerchant("LIME 2 RIDES RUUL"),
+    );
+  });
+
+  it("keeps Hebrew letters and digits, only flattening punctuation", () => {
+    expect(normalizeMerchant("סופר פארם")).toBe("סופר פארם"); // unchanged
+    expect(normalizeMerchant("רמי לוי-סניף 5")).toBe("רמי לוי סניף 5"); // '-' -> space
+    expect(normalizeMerchant('חנות הדוגמה בע"מ ')).toBe("חנות הדוגמה בע מ");
+  });
+});
+
+describe("merchantsMatch", () => {
+  // Inputs are already punctuation-normalized (see normalizeMerchant).
+  it("(a) matches differently-truncated renderings via a common prefix", () => {
+    expect(
+      merchantsMatch("google workspace rec", "google workspace recov"),
+    ).toBe(true);
+  });
+
+  it("(b) still matches the LIME *↔space case (equal after normalization)", () => {
+    expect(merchantsMatch("lime 2 rides ruul", "lime 2 rides ruul")).toBe(true);
+  });
+
+  it("(c) does NOT match short merchants below the 6-char prefix floor", () => {
+    expect(merchantsMatch("up", "upapp")).toBe(false);
+  });
+
+  it("does not match unrelated names that share no prefix", () => {
+    expect(merchantsMatch("google workspace", "microsoft azure")).toBe(false);
+  });
+
+  it("requires a real prefix, not just any 6-char overlap", () => {
+    expect(merchantsMatch("netflix", "netfli")).toBe(true); // prefix, len 6
+    expect(merchantsMatch("amazon prime", "amazon web svc")).toBe(false); // diverge after "amazon "
   });
 });
 
 describe("matchChargeDatesToGranular", () => {
-  it("sets processedDate to the FIBI charge date on a matched granular row", () => {
+  it("sets processedDate + marks bankSettled on a matched granular row", () => {
     const g = [granular({})];
     const res = matchChargeDatesToGranular(g, [expense({})]);
     expect(res.updated).toBe(1);
     expect(res.unmatched).toHaveLength(0);
     // 31/07/2026 charge date -> UTC-midnight ISO (TZ-safe downstream)
     expect(g[0].processedDate).toBe("2026-07-31T00:00:00.000Z");
+    // POSTED-by-FIBI marker for clearOnFibiSettlement
+    expect((g[0] as { bankSettled?: boolean }).bankSettled).toBe(true);
+  });
+
+  it("leaves unmatched granular UNMARKED (not bank-settled)", () => {
+    const g = [granular({ chargedAmount: -30 })]; // amount mismatch -> no match
+    const res = matchChargeDatesToGranular(g, [expense({})]);
+    expect(res.updated).toBe(0);
+    expect((g[0] as { bankSettled?: boolean }).bankSettled).toBeUndefined();
   });
 
   it("matches despite a trailing-space / casing merchant difference", () => {
@@ -63,6 +113,34 @@ describe("matchChargeDatesToGranular", () => {
     ]);
     expect(res.updated).toBe(1);
     expect(g[0].processedDate).toBe("2026-07-31T00:00:00.000Z");
+  });
+
+  it("pairs a 'LIME*2' drill-down line to a 'LIME 2' granular (punctuation folded)", () => {
+    // The real unmatched-LIME bug: '*' vs ' ' between the same words.
+    const g = [
+      granular({ description: "LIME 2 RIDES RUUL", chargedAmount: -26.3 }),
+    ];
+    const res = matchChargeDatesToGranular(g, [
+      expense({ merchant: "LIME*2 RIDES RUUL", chargeAmount: 26.3 }),
+    ]);
+    expect(res.updated).toBe(1);
+    expect(res.unmatched).toHaveLength(0);
+    expect(g[0].processedDate).toBe("2026-07-31T00:00:00.000Z");
+    expect((g[0] as { bankSettled?: boolean }).bankSettled).toBe(true);
+  });
+
+  it("pairs a TRUNCATED granular to a longer drill-down line of the same amount+date", () => {
+    // Real case: granular "GOOGLE WORKSPACE REC" vs drill-down "GOOGLE*WORKSPACE RECOV".
+    const g = [
+      granular({ description: "GOOGLE WORKSPACE REC", chargedAmount: -35 }),
+    ];
+    const res = matchChargeDatesToGranular(g, [
+      expense({ merchant: "GOOGLE*WORKSPACE RECOV", chargeAmount: 35 }),
+    ]);
+    expect(res.updated).toBe(1);
+    expect(res.unmatched).toHaveLength(0);
+    expect(g[0].processedDate).toBe("2026-07-31T00:00:00.000Z");
+    expect((g[0] as { bankSettled?: boolean }).bankSettled).toBe(true);
   });
 
   it("maps an N-purchase settlement onto N distinct granular rows (no reuse)", () => {

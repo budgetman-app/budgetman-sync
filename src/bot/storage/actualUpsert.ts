@@ -275,6 +275,12 @@ export function planActualUpsert(
   for (const tx of planned) {
     const matchDate = matchDateOf(tx);
     if (tx.isPending) {
+      // If this charge already exists as a settled/cleared row (imported under
+      // its settledImportedId), FIBI has posted it — do NOT re-add a pending
+      // duplicate if a later scrape reports it unmatched (clearOnFibiSettlement:
+      // once posted it stays posted; the enrichment window may just not re-drill
+      // it). Idempotent. (Relies on a stable settledImportedId for the charge.)
+      if (byImportedId.has(tx.settledImportedId)) continue;
       const twin = findTwin(tx.baseKey, matchDate);
       if (twin) {
         consumed.add(twin.id);

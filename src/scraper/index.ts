@@ -239,7 +239,8 @@ async function enrichCardChargeDates(
   // provider's clearing stays gated on clearOnChargeDate alone (unchanged).
   const wantEnrich =
     config.options.scraping.enrichCardChargeDates ||
-    Boolean(config.storage.actual?.clearOnChargeDate);
+    Boolean(config.storage.actual?.clearOnChargeDate) ||
+    Boolean(config.storage.actual?.clearOnFibiSettlement);
   if (!wantEnrich) return;
 
   const fibiContext = contextByCompany.get(CompanyTypes.beinleumi);

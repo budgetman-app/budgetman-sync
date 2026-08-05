@@ -16,6 +16,14 @@ export interface TransactionRow extends Transaction {
   companyId: CompanyTypes;
   hash: string;
   uniqueId: string;
+  /**
+   * Set by the FIBI settlement enrichment (matchChargeDatesToGranular): this
+   * charge was matched to a POSTED FIBI settlement drill-down, so FIBI has
+   * actually posted it. Under `clearOnFibiSettlement` this is the signal to clear
+   * it; unmatched card charges stay uncleared. Carried through resultsToTransactions'
+   * spread of the enriched raw Transaction.
+   */
+  bankSettled?: boolean;
 }
 
 export interface AccountScrapeResult {

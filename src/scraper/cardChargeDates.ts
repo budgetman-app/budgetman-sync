@@ -23,16 +23,42 @@ const logger = createLogger("card-charge-dates");
 // All of this is opt-in (default off) and best-effort: any failure leaves the
 // transactions untouched and the standard import unaffected.
 
-/** Normalize a merchant string for cross-source matching. */
+/**
+ * Normalize a merchant string for cross-source matching. Isracard renders the
+ * same merchant inconsistently across buckets — the settlement drill-down gives
+ * "LIME*2 RIDES RUUL" while the granular gives "LIME 2 RIDES RUUL" — so we fold
+ * any run of punctuation/separators (`*`, `-`, etc.) to a single space, then
+ * collapse whitespace, trim, and lower-case. Conservative: keeps letters
+ * (incl. Hebrew) and digits; only non-alphanumeric separators are flattened.
+ */
 export function normalizeMerchant(name: string | undefined): string {
   return (name ?? "")
-    .replace(/\s+/g, " ") // collapse runs of whitespace (incl. trailing &nbsp;)
+    .replace(/[^\p{L}\p{N}]+/gu, " ") // punctuation/separators -> single space
+    .replace(/\s+/g, " ") // collapse remaining whitespace
     .trim()
     .toLocaleLowerCase();
 }
 
 function amountKeyMinor(n: number | undefined): number {
   return Math.round(Math.abs(Number(n ?? 0)) * 100);
+}
+
+/** Shortest common-prefix length below which a prefix match is too loose. */
+const MERCHANT_PREFIX_FLOOR = 6;
+
+/**
+ * Prefix-tolerant merchant equality on two ALREADY-normalized names. Isracard
+ * truncates merchant names differently across buckets — the granular gives
+ * "google workspace rec", the drill-down "google workspace recov" — so exact
+ * equality misses them. Since amount + purchase-date already strongly identify
+ * the charge and merchant is only the tiebreak, we accept a prefix match once the
+ * shorter name is at least MERCHANT_PREFIX_FLOOR chars (avoids spurious short
+ * collisions like "up" vs "upapp").
+ */
+export function merchantsMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (Math.min(a.length, b.length) < MERCHANT_PREFIX_FLOOR) return false;
+  return a.startsWith(b) || b.startsWith(a);
 }
 
 /** `DD/MM/YYYY` or `DD.MM.YYYY` (2- or 4-digit year) -> `YYYY-MM-DD`. */
@@ -66,8 +92,9 @@ export interface MatchResult {
  *
  * Matching heuristic (chosen for cross-source robustness):
  *   normalized merchant  +  |amount| in minor units  +  purchase calendar date
- * - merchant is normalized (whitespace collapsed, trimmed, lower-cased) because
- *   the two sources differ on trailing spaces / casing;
+ * - merchant is normalized (punctuation/whitespace folded, trimmed, lower-cased)
+ *   and compared prefix-tolerantly (see `merchantsMatch`) because the two sources
+ *   differ on separators AND truncate names differently;
  * - amount is compared sign-insensitively in integer minor units (both sources
  *   store ILS, so `chargeAmount` vs the granular `chargedAmount`);
  * - the purchase date is compared as an Asia/Jerusalem calendar date (TZ-safe).
@@ -93,9 +120,9 @@ export function matchChargeDatesToGranular(
     const idx = granular.findIndex(
       (g, i) =>
         !consumed.has(i) &&
-        normalizeMerchant(g.description) === wantMerchant &&
         amountKeyMinor(g.chargedAmount) === wantAmount &&
-        toJerusalemDate(g.date) === wantDate,
+        toJerusalemDate(g.date) === wantDate &&
+        merchantsMatch(normalizeMerchant(g.description), wantMerchant),
     );
 
     if (idx === -1 || !chargeIso) {
@@ -110,6 +137,11 @@ export function matchChargeDatesToGranular(
 
     consumed.add(idx);
     granular[idx].processedDate = chargeIso;
+    // Mark it POSTED by FIBI: this granular appears in a booked settlement
+    // drill-down, so under `clearOnFibiSettlement` it may clear. Unmatched
+    // granular are left unmarked (they stay uncleared until FIBI posts them).
+    (granular[idx] as Transaction & { bankSettled?: boolean }).bankSettled =
+      true;
     updated++;
     report.push(
       `charge date set: ${expense.merchant.trim()} ${expense.purchaseDate} -> charge ${expense.chargeDate}`,

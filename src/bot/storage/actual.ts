@@ -24,6 +24,23 @@ import { anchorFxAmount, type FibiAuth } from "./fxAnchor.js";
 
 const logger = createLogger("ActualBudgetStorage");
 
+// FIBI posts card settlements within ~2-3 days of the charge. Under
+// `clearOnFibiSettlement`, a card charge the enrichment could NOT confirm (no
+// drill-down match — e.g. a settlement outside the scrape window) still clears
+// once it is at least this many days old, so the unconfirmable tail never sits
+// uncleared forever and breaks the reconciliation formula. 5 is a safe margin so
+// we never clear ahead of FIBI. `bankSettled` always wins (precise charge date);
+// this lag is only a floor.
+const FIBI_SETTLE_LAG_DAYS = 5;
+
+/** Whole-day (today − date) in Asia/Jerusalem calendar days; negative if future. */
+function daysAgo(date: string, today: string): number {
+  return (
+    (Date.parse(`${today}T00:00:00Z`) - Date.parse(`${date}T00:00:00Z`)) /
+    86_400_000
+  );
+}
+
 export class ActualBudgetStorage implements TransactionStorage {
   private bankToActualAccountMap = new Map<string, string>();
   private accountIdToNameMap = new Map<string, string>();
@@ -363,10 +380,18 @@ export class ActualBudgetStorage implements TransactionStorage {
   /**
    * Build FX-anchor overrides (opt-in via `anchorFxToFibi`): pool the FIBI FX
    * auth amounts (they stay excluded — used only as an amount source), then for
-   * each Isracard FX PENDING charge pick the best matching auth and record its
-   * ILS amount as the override. Consumable once each. `chargedAmount` is the only
-   * thing overridden; originalAmount/currency/merchant are untouched, so the
-   * FX-stable collapse key is unaffected. Settled charges are never anchored.
+   * each Isracard FX charge pick the best matching auth and record its ILS amount
+   * as the override. Consumable once each. `chargedAmount` is the only thing
+   * overridden; originalAmount/currency/merchant are untouched, so the FX-stable
+   * collapse key is unaffected.
+   *
+   * The principle: match FIBI whenever it is still HOLDING the charge as an auth
+   * — a matched charge stays uncleared at FIBI's hold amount (see toIncoming's
+   * `fibiHolding`), and only clears at the true settled amount once FIBI posts it
+   * (its auth is gone -> no match). A PENDING Isracard charge is always eligible;
+   * a COMPLETED one only when `upsert` is on (the collapse that later flips it to
+   * settled lives on the upsert path — never keep a completed charge pending on
+   * the non-upsert path, where it could not later settle).
    */
   private computeFxAnchors(
     txns: Array<TransactionRow>,
@@ -380,10 +405,13 @@ export class ActualBudgetStorage implements TransactionStorage {
       }));
     if (pool.length === 0) return overrides;
 
+    const upsert = Boolean(this.config.storage.actual?.upsert);
+
     for (const tx of txns) {
-      if (tx.status !== TransactionStatuses.Pending) continue;
       if (tx.companyId !== CompanyTypes.isracard) continue;
       if (!tx.originalCurrency || tx.originalCurrency === "ILS") continue; // FX only
+      const isPending = tx.status === TransactionStatuses.Pending;
+      if (!isPending && !upsert) continue; // completed FX anchoring needs upsert
 
       const isracardMinor = actualApi.utils.amountToInteger(tx.chargedAmount);
       const res = anchorFxAmount(
@@ -395,9 +423,21 @@ export class ActualBudgetStorage implements TransactionStorage {
         pool,
       );
 
+      const anchored = res.consumedIndex !== null;
+      if (anchored) {
+        overrides.set(tx, res.amountMinor);
+        pool = pool.filter((_, i) => i !== res.consumedIndex);
+      }
+
       // One observability line per FX decision — a running dataset to confirm
-      // (or refute) the ~4% FIBI/Isracard FX spread hypothesis.
+      // (or refute) the ~4% FIBI/Isracard FX spread hypothesis, and to show the
+      // hold/posted state we acted on.
       const ils = (m: number) => (Math.abs(m) / 100).toFixed(2);
+      const state = anchored
+        ? "anchored (fibi still holding, kept pending)"
+        : isPending
+          ? "unanchored (kept isracard pending)"
+          : "settled (fibi posted)";
       const parts = [
         `fx anchor: ${tx.description}`,
         `${Math.abs(tx.originalAmount).toFixed(2)} ${tx.originalCurrency}`,
@@ -407,13 +447,8 @@ export class ActualBudgetStorage implements TransactionStorage {
         parts.push(`fibi=₪${ils(res.candidateMinor)}`);
         parts.push(`ratio=${res.ratio.toFixed(4)}`);
       }
-      parts.push(`-> ${res.outcome}`);
+      parts.push(`-> ${state}`);
       logger(parts.join(" "));
-
-      if (res.consumedIndex !== null) {
-        overrides.set(tx, res.amountMinor);
-        pool = pool.filter((_, i) => i !== res.consumedIndex);
-      }
     }
     return overrides;
   }
@@ -434,24 +469,48 @@ export class ActualBudgetStorage implements TransactionStorage {
     const clearOnChargeDate = Boolean(
       this.config.storage.actual?.clearOnChargeDate,
     );
+    const clearOnFibiSettlement = Boolean(
+      this.config.storage.actual?.clearOnFibiSettlement,
+    );
+    const isCardChargeRow = this.isCardCharge(tx);
 
     // The MATCH key always uses the purchase date so a pending charge and its
     // settled twin share a base key (the settled row may be dated on a later
-    // bank charge date — that must not break the collapse). Under the new flag
-    // the purchase date is formatted TZ-safely; otherwise the upstream UTC
+    // bank charge date — that must not break the collapse). Under either clearing
+    // flag the purchase date is formatted TZ-safely; otherwise the upstream UTC
     // formatting is preserved so default behavior is byte-for-byte unchanged.
-    const keyDate = clearOnChargeDate
-      ? toJerusalemDate(tx.date)
-      : new Date(tx.date).toISOString().split("T")[0];
+    const keyDate =
+      clearOnChargeDate || clearOnFibiSettlement
+        ? toJerusalemDate(tx.date)
+        : new Date(tx.date).toISOString().split("T")[0];
 
-    // For a COMPLETED card charge under clearOnChargeDate, its effective charge
-    // date is processedDate — set to the real (past) bank charge date when the
-    // FIBI drill-down enrichment matched it, else still the FUTURE monthly-
-    // statement placeholder the scraper reports.
-    const cardChargeDate =
-      clearOnChargeDate && this.isCardCharge(tx) && !isPending
-        ? toJerusalemDate(tx.processedDate ?? tx.date)
-        : undefined;
+    const today = toJerusalemDate(new Date());
+
+    // The card-charge clearing date, and whether FIBI has actually posted it.
+    // Under `clearOnFibiSettlement` the authoritative signal is the enrichment
+    // MATCH (`tx.bankSettled`): a matched granular is in a POSTED FIBI settlement
+    // -> clear it on the FIBI charge date. An unmatched card charge is kept
+    // UNCLEARED on the purchase date until FIBI posts it — UNLESS it is already
+    // at least FIBI_SETTLE_LAG_DAYS old, in which case FIBI has certainly posted
+    // it (the drill-down just didn't confirm it) so we clear it on the purchase
+    // date. This supersedes clearOnChargeDate's charge-date<=today trigger for
+    // CARD charges.
+    let cardChargeDate: string | undefined;
+    let fibiSettlementPending = false;
+    if (clearOnFibiSettlement && isCardChargeRow && !isPending) {
+      if (tx.bankSettled) {
+        cardChargeDate = toJerusalemDate(tx.processedDate ?? tx.date);
+      } else if (daysAgo(keyDate, today) >= FIBI_SETTLE_LAG_DAYS) {
+        cardChargeDate = keyDate; // time-lag fallback: cleared on the purchase date
+      } else {
+        fibiSettlementPending = true;
+      }
+    } else if (clearOnChargeDate && isCardChargeRow && !isPending) {
+      // For a COMPLETED card charge under clearOnChargeDate, its effective charge
+      // date is processedDate — the real (past) bank charge date when the FIBI
+      // enrichment matched it, else still the FUTURE monthly-statement placeholder.
+      cardChargeDate = toJerusalemDate(tx.processedDate ?? tx.date);
+    }
 
     // A charge whose effective charge date is still in the future has not been
     // charged yet (FIBI holds it as a pending auth). Importing it cleared on that
@@ -459,17 +518,25 @@ export class ActualBudgetStorage implements TransactionStorage {
     // the purchase date — it collapses onto the real settled row later (signature
     // key) and clears on the true FIBI charge date once that date is <= today.
     const chargeInFuture =
-      cardChargeDate !== undefined &&
-      cardChargeDate > toJerusalemDate(new Date());
+      cardChargeDate !== undefined && cardChargeDate > today;
 
-    const effectivePending = isPending || chargeInFuture;
+    // FIBI is still HOLDING this FX charge as an auth (a FIBI מטח auth matched in
+    // computeFxAnchors, so an override exists). Keep it uncleared at FIBI's hold
+    // amount until FIBI posts it (auth gone -> no match next run -> it settles and
+    // the kept-pending row collapses onto it via the pend:sig_ key). Same handling
+    // as a future-dated charge; the trigger is "FIBI still holds it".
+    const fibiHolding = this.fxOverrides.has(tx);
+
+    const effectivePending =
+      isPending || chargeInFuture || fibiHolding || fibiSettlementPending;
 
     // The Actual ROW date. A settled domestic card charge that has actually been
     // charged (charge date <= today) is dated on that real bank charge date so
     // cleared rows reconstruct FIBI's running balance; everything else (pending,
-    // or a not-yet-charged future card charge) stays on the purchase date.
+    // a not-yet-charged future card charge, or a still-FIBI-held FX charge) stays
+    // on the purchase date.
     const rowDate =
-      cardChargeDate !== undefined && !chargeInFuture
+      cardChargeDate !== undefined && !chargeInFuture && !fibiHolding
         ? cardChargeDate
         : keyDate;
 
@@ -550,7 +617,8 @@ export class ActualBudgetStorage implements TransactionStorage {
 
       const plan = planActualUpsert(incoming, existing, {
         updateDateOnSettle: Boolean(
-          this.config.storage.actual?.clearOnChargeDate,
+          this.config.storage.actual?.clearOnChargeDate ||
+          this.config.storage.actual?.clearOnFibiSettlement,
         ),
       });
       logger(

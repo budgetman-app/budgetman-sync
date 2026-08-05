@@ -67,6 +67,17 @@ export const ActualSchema = z.object({
   // NOT the bank charge date — see docs/impl-notes-card-lifecycle.md). Requires
   // upsert. Default off leaves the purchase-date/clear-on-complete behavior.
   clearOnChargeDate: z.boolean().default(false),
+  // clearOnFibiSettlement (budgetman): the authoritative "FIBI posted it" signal
+  // for clearing a card charge is the enrichment MATCH to a FIBI settlement
+  // drill-down (SUGBAKA=211), not the Isracard charge-date. When on, a card
+  // charge clears (on the FIBI charge date) ONLY when the enrichment marked it
+  // bank-settled; an unmatched card charge stays UNCLEARED on the purchase date
+  // at Isracard's amount until FIBI posts it (then it flips to cleared via the
+  // pend:sig_ collapse, no dupe). This keeps Actual's cleared ledger == FIBI's
+  // posted ledger so `Actual − (Isracard-only uncleared) == FIBI current`.
+  // Implies the enrichment runs (so the marks exist). Requires upsert. Supersedes
+  // clearOnChargeDate's charge-date<=today trigger for CARD charges. Default off.
+  clearOnFibiSettlement: z.boolean().default(false),
   // anchorFxToFibi (budgetman): make an Isracard FX PENDING charge's provisional
   // ILS amount match FIBI's current auth-hold ILS, so Actual's working balance
   // tracks FIBI's current balance during reconciliation. Both sides' ILS is a
