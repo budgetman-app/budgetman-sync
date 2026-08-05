@@ -61,6 +61,60 @@ export function merchantsMatch(a: string, b: string): boolean {
   return a.startsWith(b) || b.startsWith(a);
 }
 
+/** FX-stable identity of a charge for approval<->completed de-dup: |originalAmount|
+ * (minor units) + originalCurrency + normalized merchant + Asia/Jerusalem purchase
+ * date. Same-source (Isracard vs Isracard), so merchant uses exact normalized
+ * equality, not the prefix tolerance used cross-source. */
+function chargeSignature(tx: Transaction): string {
+  return [
+    amountKeyMinor(tx.originalAmount),
+    tx.originalCurrency ?? "",
+    normalizeMerchant(tx.description),
+    toJerusalemDate(tx.date),
+  ].join("|");
+}
+
+/**
+ * Drop stale Isracard approvals (pending) that Isracard has ALREADY CAPTURED as a
+ * Completed transaction in the same account. A charge present in BOTH buckets
+ * would otherwise import twice — under `clearOnFibiSettlement` the completed one
+ * is kept-pending too, so two same-signature pending rows land in one batch and
+ * `findTwin` (which ignores same-batch adds) can't collapse them (the live
+ * ארומה −17 double). The approval is the stale copy; keep the completed one.
+ *
+ * Match by `chargeSignature`. CONSUME-ONCE by count: remove at most as many
+ * approvals as there are matching completed twins, so N genuinely-distinct
+ * same-signature charges (which appear together in ONE bucket) are untouched, and
+ * a real still-pending charge alongside a captured twin survives. Order-preserving.
+ * Correct in general (a captured charge shouldn't also show as pending),
+ * independent of any flag.
+ */
+export function dedupeApprovalsAgainstCompleted(
+  approvals: Transaction[],
+  completed: Transaction[],
+): Transaction[] {
+  if (approvals.length === 0 || completed.length === 0) return approvals;
+
+  const completedTwins = new Map<string, number>();
+  for (const c of completed) {
+    if (c.status !== TransactionStatuses.Completed) continue;
+    const k = chargeSignature(c);
+    completedTwins.set(k, (completedTwins.get(k) ?? 0) + 1);
+  }
+
+  const kept: Transaction[] = [];
+  for (const a of approvals) {
+    const k = chargeSignature(a);
+    const remaining = completedTwins.get(k) ?? 0;
+    if (remaining > 0) {
+      completedTwins.set(k, remaining - 1); // consume one twin, drop this approval
+      continue;
+    }
+    kept.push(a);
+  }
+  return kept;
+}
+
 /** `DD/MM/YYYY` or `DD.MM.YYYY` (2- or 4-digit year) -> `YYYY-MM-DD`. */
 function ddmmyyyyToCalendar(s: string): string | null {
   const m = /(\d{2})[./](\d{2})[./](\d{2,4})/.exec(s ?? "");

@@ -11,6 +11,7 @@ import { parallelLimit } from "async";
 import { config } from "../config.js";
 import { fetchIsracardPendingByAccount } from "./isracardPending.js";
 import {
+  dedupeApprovalsAgainstCompleted,
   enrichFibiCardChargeDates,
   isIsracardSettlementDebit,
 } from "./cardChargeDates.js";
@@ -207,8 +208,17 @@ async function mergeIsracardPending(
     for (const acc of result.accounts ?? []) {
       const pending = pendingByAccount.get(acc.accountNumber);
       if (pending?.length) {
-        acc.txns.unshift(...pending);
-        merged += pending.length;
+        // Drop approvals Isracard has already captured as a Completed txn in this
+        // account (the stale copy) — else the charge imports twice.
+        const deduped = dedupeApprovalsAgainstCompleted(pending, acc.txns);
+        const dropped = pending.length - deduped.length;
+        if (dropped > 0) {
+          logger(
+            `dropped ${dropped} stale approval(s) already captured on ${acc.accountNumber}`,
+          );
+        }
+        acc.txns.unshift(...deduped);
+        merged += deduped.length;
       }
     }
     logger(`merged ${merged} Isracard pending transaction(s)`);

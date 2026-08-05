@@ -1,4 +1,5 @@
 import {
+  dedupeApprovalsAgainstCompleted,
   matchChargeDatesToGranular,
   merchantsMatch,
   normalizeMerchant,
@@ -84,6 +85,95 @@ describe("merchantsMatch", () => {
   it("requires a real prefix, not just any 6-char overlap", () => {
     expect(merchantsMatch("netflix", "netfli")).toBe(true); // prefix, len 6
     expect(merchantsMatch("amazon prime", "amazon web svc")).toBe(false); // diverge after "amazon "
+  });
+});
+
+describe("dedupeApprovalsAgainstCompleted", () => {
+  // ארומה −17 on 04/08: the real double — same charge in both buckets.
+  const approval = (over: Partial<Transaction> = {}): Transaction => ({
+    type: TransactionTypes.Normal,
+    identifier: undefined,
+    date: "2026-08-04T00:00:00.000Z",
+    processedDate: "2026-08-04T00:00:00.000Z",
+    originalAmount: -17,
+    originalCurrency: "ILS",
+    chargedAmount: -17,
+    chargedCurrency: "ILS",
+    description: "ארומה",
+    status: TransactionStatuses.Pending,
+    memo: "",
+    ...over,
+  });
+  const completed = (over: Partial<Transaction> = {}): Transaction =>
+    approval({
+      status: TransactionStatuses.Completed,
+      identifier: "V",
+      ...over,
+    });
+
+  it("(a) drops an approval that Isracard already captured as a completed txn", () => {
+    const kept = dedupeApprovalsAgainstCompleted([approval()], [completed()]);
+    expect(kept).toHaveLength(0);
+  });
+
+  it("(b) keeps an approval with no completed twin", () => {
+    const kept = dedupeApprovalsAgainstCompleted(
+      [approval()],
+      [
+        completed({
+          description: "משהו אחר",
+          chargedAmount: -50,
+          originalAmount: -50,
+        }),
+      ],
+    );
+    expect(kept).toHaveLength(1);
+    expect(kept[0].description).toBe("ארומה");
+  });
+
+  it("(c) leaves distinct same-signature charges in one bucket untouched (3 pending, 0 completed)", () => {
+    const three = [approval(), approval(), approval()];
+    const kept = dedupeApprovalsAgainstCompleted(three, []);
+    expect(kept).toHaveLength(3);
+  });
+
+  it("(d) consume-once: 2 same-signature approvals + 1 completed twin -> keeps one", () => {
+    const kept = dedupeApprovalsAgainstCompleted(
+      [approval(), approval()],
+      [completed()],
+    );
+    expect(kept).toHaveLength(1); // one stale dup dropped, the genuine pending kept
+  });
+
+  it("does not match across a different merchant, amount, or purchase date", () => {
+    expect(
+      dedupeApprovalsAgainstCompleted(
+        [approval()],
+        [completed({ description: "ארומה תל אביב" })], // different merchant
+      ),
+    ).toHaveLength(1);
+    expect(
+      dedupeApprovalsAgainstCompleted(
+        [approval()],
+        [completed({ originalAmount: -18, chargedAmount: -18 })], // different amount
+      ),
+    ).toHaveLength(1);
+    expect(
+      dedupeApprovalsAgainstCompleted(
+        [approval()],
+        [completed({ date: "2026-08-03T00:00:00.000Z" })], // different date
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("ignores non-completed rows in the completed pool and preserves order", () => {
+    const a1 = approval({ description: "ראשון" });
+    const a2 = approval(); // ארומה, has a completed twin
+    const kept = dedupeApprovalsAgainstCompleted(
+      [a1, a2],
+      [approval() /* pending, not a twin */, completed()],
+    );
+    expect(kept.map((k) => k.description)).toEqual(["ראשון"]);
   });
 });
 
