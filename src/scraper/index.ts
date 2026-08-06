@@ -17,6 +17,8 @@ import {
 } from "./cardChargeDates.js";
 import type { Transaction } from "israeli-bank-scrapers/lib/transactions.js";
 import { TransactionStatuses } from "israeli-bank-scrapers/lib/transactions.js";
+import { dropStalePendingCharges } from "./stalePending.js";
+import { toJerusalemDate } from "../bot/storage/dates.js";
 
 const logger = createLogger("scraper");
 
@@ -156,6 +158,7 @@ async function scrapeAccount(
   );
 
   await mergeIsracardPending(account, result, browserContext);
+  dropStaleIsracardPending(account, result);
 
   const duration = (performance.now() - scraperStart) / 1000;
   logger(`scraping ended, took ${duration.toFixed(1)}s`);
@@ -165,6 +168,35 @@ async function scrapeAccount(
     companyId: account.companyId,
     result,
   };
+}
+
+/**
+ * budgetman (opt-in via `scraping.dropStalePendingDays`): remove orphaned Isracard
+ * pre-authorizations — PENDING charges older than the threshold that were captured
+ * bundled under a new reference and never voided, so they linger for weeks and
+ * double-count an item already in a settled bundle (see stalePending.ts). Scoped
+ * to Isracard; FIBI manages its own auth-hold releases. Best effort, in place.
+ */
+function dropStaleIsracardPending(
+  account: AccountConfig,
+  result: Awaited<ReturnType<typeof getAccountTransactions>>,
+): void {
+  const days = config.options.scraping.dropStalePendingDays;
+  if (!(days > 0) || account.companyId !== CompanyTypes.isracard) return;
+  const todayCal = toJerusalemDate(new Date().toISOString());
+  for (const acc of result.accounts ?? []) {
+    if (!acc.txns?.length) continue;
+    const { kept, dropped } = dropStalePendingCharges(acc.txns, days, todayCal);
+    if (dropped.length > 0) {
+      acc.txns = kept;
+      logger(
+        `dropped ${dropped.length} stale pending (>${days}d, orphaned auths): ` +
+          dropped
+            .map((d) => `${d.description} ₪${Math.abs(d.chargedAmount)}`)
+            .join(", "),
+      );
+    }
+  }
 }
 
 /**

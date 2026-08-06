@@ -215,6 +215,13 @@ export const ScrapingOptionsSchema = z.object({
   // production turns that on, which also implies this enrichment. Enrichment fires
   // when this OR storage.actual.clearOnChargeDate is true.
   enrichCardChargeDates: z.boolean().default(false),
+  // (budgetman, opt-in, default 0 = off) Drop Isracard PENDING charges whose
+  // purchase date is older than this many days — orphaned pre-authorizations that
+  // were captured bundled under a new reference and never voided (e.g. Lime
+  // per-ride auths that already settled inside a bundle, but linger for weeks).
+  // A genuine pending settles within days, so a conservative value (~14) never
+  // touches real in-flight charges; a late settle just re-appears next scrape.
+  dropStalePendingDays: z.number().min(0).max(90).default(0),
   transactionHashType: z.enum(["", "moneyman"]).default(""),
   additionalTransactionInfo: z.boolean().default(false),
   includeRawTransaction: z.boolean().default(false),
