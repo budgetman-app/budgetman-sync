@@ -198,13 +198,22 @@ export function convertFibiExpenseToTransaction(
   };
 }
 
+/** One settlement debit's drill-down result: the itemised ILS expenses behind
+ * it. FX charges are NOT itemised here (they sit in a separate, non-tabular
+ * "עסקאות במט"ח" section), so a batch's FX total is recovered as the RESIDUAL:
+ * |debit total| − Σ(these ILS expenses). See `matchFxResidualsToGranular`. */
+export interface FibiSettlementDrilldown {
+  ref: FibiSettlementRef;
+  expenses: FibiCardExpense[];
+}
+
 /**
  * Fetch + parse the itemised card expenses for a set of settlement debits,
  * reusing the already authenticated FIBI browser context. Read-only, best
  * effort: on any failure it logs and returns what it has, so the standard import
- * is unaffected. Returns the raw parsed rows (purchase date, charge date,
- * merchant, amounts) — the enrichment matcher keys the real bank charge date
- * onto the Isracard granular transaction; see `cardChargeDates.ts`.
+ * is unaffected. Returns one entry PER input ref (in order, empty on failure) so
+ * the caller can pair each batch's ILS rows with that debit's own total to
+ * recover the FX residual; see `cardChargeDates.ts`.
  *
  * NOTE: the drill-down HTML is validated (2026-08-02); the live session hookup
  * and the `I-SEL-MS-KARTIS` ref construction still need an owner-gated dry-run
@@ -213,27 +222,28 @@ export function convertFibiExpenseToTransaction(
 export async function fetchFibiCardExpenses(
   browserContext: BrowserContext,
   settlements: FibiSettlementRef[],
-): Promise<FibiCardExpense[]> {
-  const out: FibiCardExpense[] = [];
+): Promise<FibiSettlementDrilldown[]> {
+  const out: FibiSettlementDrilldown[] = [];
   let page;
   try {
     page = await browserContext.newPage();
     for (const ref of settlements) {
       const url = buildFibiCardExpensesUrl(ref);
+      let expenses: FibiCardExpense[] = [];
       try {
         const resp = await page.goto(url, {
           waitUntil: "networkidle2",
           timeout: 60_000,
         });
         const html = (await resp?.text()) ?? "";
-        const expenses = parseFibiCardExpenses(html);
-        out.push(...expenses);
+        expenses = parseFibiCardExpenses(html);
         logger(
           `parsed ${expenses.length} expense(s) for settlement ${ref.cardStatementRef} @ ${ref.chargeDate}`,
         );
       } catch (e) {
         logger(`failed to fetch settlement ${ref.cardStatementRef}`, e);
       }
+      out.push({ ref, expenses });
     }
   } catch (e) {
     logger("failed to open FIBI card-expenses page", e);

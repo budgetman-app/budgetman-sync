@@ -1,6 +1,7 @@
 import {
   dedupeApprovalsAgainstCompleted,
   matchChargeDatesToGranular,
+  matchFxResidualsToGranular,
   merchantsMatch,
   normalizeMerchant,
   settlementRefFromDebit,
@@ -299,5 +300,193 @@ describe("isIsracardSettlementDebit / settlementRefFromDebit", () => {
   it("returns null when the card/reference cannot be derived", () => {
     expect(settlementRefFromDebit(debit({ description: "משכורת" }))).toBeNull();
     expect(settlementRefFromDebit(debit({ identifier: undefined }))).toBeNull();
+  });
+});
+
+describe("matchFxResidualsToGranular", () => {
+  const bankSettled = (t: Transaction) =>
+    (t as Transaction & { bankSettled?: boolean }).bankSettled === true;
+
+  it("attributes an all-FX batch residual to the single FX granular (Upstash)", () => {
+    // 05/08 batch: no ILS rows, total ₪61.21 -> residual 61.21 = Upstash.
+    const up = granular({
+      description: "UPSTASH",
+      originalCurrency: "USD",
+      originalAmount: -20,
+      chargedAmount: -61.21,
+      date: "2026-08-03T00:00:00.000Z",
+    });
+    const res = matchFxResidualsToGranular(
+      [up],
+      [
+        {
+          chargeDateIso: "2026-08-05T00:00:00.000Z",
+          totalMinor: 6121,
+          expenses: [],
+        },
+      ],
+    );
+    expect(res.updated).toBe(1);
+    expect(bankSettled(up)).toBe(true);
+    expect(up.processedDate).toBe("2026-08-05T00:00:00.000Z");
+  });
+
+  it("recovers the FX residual behind itemised ILS rows (Google in a mixed batch)", () => {
+    // 03/08 batch total ₪153.93 = ₪96.35 ILS (7.35 + 89.00) + ₪57.58 FX (Google).
+    const google = granular({
+      description: "GOOGLE WORKSPACE REC",
+      originalCurrency: "EUR",
+      originalAmount: -16.2,
+      chargedAmount: -57.58,
+      date: "2026-08-01T00:00:00.000Z",
+    });
+    const res = matchFxResidualsToGranular(
+      [google],
+      [
+        {
+          chargeDateIso: "2026-08-03T00:00:00.000Z",
+          totalMinor: 15393,
+          expenses: [
+            expense({ chargeAmount: 7.35 }),
+            expense({ chargeAmount: 89.0 }),
+          ],
+        },
+      ],
+    );
+    expect(res.updated).toBe(1);
+    expect(bankSettled(google)).toBe(true);
+    expect(google.processedDate).toBe("2026-08-03T00:00:00.000Z");
+  });
+
+  it("leaves a multi-FX batch to the lag (residual matches no single charge)", () => {
+    const a = granular({
+      description: "A",
+      originalCurrency: "USD",
+      chargedAmount: -30,
+      date: "2026-08-03T00:00:00.000Z",
+    });
+    const b = granular({
+      description: "B",
+      originalCurrency: "USD",
+      chargedAmount: -31.21,
+      date: "2026-08-03T00:00:00.000Z",
+    });
+    const res = matchFxResidualsToGranular(
+      [a, b],
+      [
+        {
+          chargeDateIso: "2026-08-05T00:00:00.000Z",
+          totalMinor: 6121,
+          expenses: [],
+        },
+      ],
+    );
+    expect(res.updated).toBe(0);
+    expect(bankSettled(a)).toBe(false);
+    expect(bankSettled(b)).toBe(false);
+  });
+
+  it("does not attribute to an ILS charge, only FX", () => {
+    const ils = granular({
+      chargedAmount: -61.21,
+      originalCurrency: "ILS",
+      date: "2026-08-03T00:00:00.000Z",
+    });
+    const res = matchFxResidualsToGranular(
+      [ils],
+      [
+        {
+          chargeDateIso: "2026-08-05T00:00:00.000Z",
+          totalMinor: 6121,
+          expenses: [],
+        },
+      ],
+    );
+    expect(res.updated).toBe(0);
+    expect(bankSettled(ils)).toBe(false);
+  });
+
+  it("skips when two FX charges are equally plausible (ambiguous residual)", () => {
+    const a = granular({
+      description: "A",
+      originalCurrency: "USD",
+      chargedAmount: -61.21,
+      date: "2026-08-03T00:00:00.000Z",
+    });
+    const b = granular({
+      description: "B",
+      originalCurrency: "EUR",
+      chargedAmount: -61.21,
+      date: "2026-08-04T00:00:00.000Z",
+    });
+    const res = matchFxResidualsToGranular(
+      [a, b],
+      [
+        {
+          chargeDateIso: "2026-08-05T00:00:00.000Z",
+          totalMinor: 6121,
+          expenses: [],
+        },
+      ],
+    );
+    expect(res.updated).toBe(0);
+  });
+
+  it("ignores a residual below the rounding-noise floor", () => {
+    const fx = granular({
+      originalCurrency: "USD",
+      chargedAmount: -0.3,
+      date: "2026-08-03T00:00:00.000Z",
+    });
+    const res = matchFxResidualsToGranular(
+      [fx],
+      [
+        {
+          chargeDateIso: "2026-08-05T00:00:00.000Z",
+          totalMinor: 30,
+          expenses: [],
+        },
+      ],
+    );
+    expect(res.updated).toBe(0);
+  });
+
+  it("does not attribute across a too-old FX purchase (outside the settlement window)", () => {
+    const old = granular({
+      originalCurrency: "USD",
+      chargedAmount: -61.21,
+      date: "2026-06-01T00:00:00.000Z",
+    });
+    const res = matchFxResidualsToGranular(
+      [old],
+      [
+        {
+          chargeDateIso: "2026-08-05T00:00:00.000Z",
+          totalMinor: 6121,
+          expenses: [],
+        },
+      ],
+    );
+    expect(res.updated).toBe(0);
+  });
+
+  it("does not re-settle a charge already marked bankSettled", () => {
+    const g = granular({
+      originalCurrency: "USD",
+      chargedAmount: -61.21,
+      date: "2026-08-03T00:00:00.000Z",
+    });
+    (g as Transaction & { bankSettled?: boolean }).bankSettled = true;
+    const res = matchFxResidualsToGranular(
+      [g],
+      [
+        {
+          chargeDateIso: "2026-08-05T00:00:00.000Z",
+          totalMinor: 6121,
+          expenses: [],
+        },
+      ],
+    );
+    expect(res.updated).toBe(0);
   });
 });

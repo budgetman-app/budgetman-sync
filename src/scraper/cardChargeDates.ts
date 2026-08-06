@@ -9,6 +9,13 @@ import {
   type FibiSettlementRef,
 } from "./fibiCardExpenses.js";
 
+/** Below this the FX residual is rounding noise, not a foreign charge (₪0.50). */
+const FX_RESIDUAL_MIN_MINOR = 50;
+/** A settlement's charge date may lag the FX purchase date by up to this many
+ * days (and, for TZ slack, precede it by up to 2). */
+const FX_SETTLEMENT_MAX_LAG_DAYS = 21;
+const FX_SETTLEMENT_MIN_LAG_DAYS = -2;
+
 const logger = createLogger("card-charge-dates");
 
 // Card-lifecycle enrichment (#14, HYBRID): Isracard supplies the merchant NAME +
@@ -205,6 +212,90 @@ export function matchChargeDatesToGranular(
   return { updated, unmatched, report };
 }
 
+/** Signed calendar-day gap (b − a) for `YYYY-MM-DD` strings. */
+function calDayGap(a: string, b: string): number {
+  const da = Date.parse(`${a}T00:00:00Z`);
+  const db = Date.parse(`${b}T00:00:00Z`);
+  if (Number.isNaN(da) || Number.isNaN(db)) return Number.POSITIVE_INFINITY;
+  return (db - da) / 86_400_000;
+}
+
+/** One FIBI settlement debit + the ILS expenses itemised behind it. `totalMinor`
+ * is |the debit amount|; `chargeDateIso` is the debit's own posting date. */
+export interface FxResidualBatch {
+  chargeDateIso: string;
+  totalMinor: number;
+  expenses: FibiCardExpense[];
+}
+
+/**
+ * Clear FX card charges on their real FIBI settlement date (not the 5-day lag).
+ *
+ * FIBI's SUGBAKA=211 drill-down itemises only the ILS charges in a batch; a
+ * foreign charge shows up solely as the batch's FX RESIDUAL:
+ *   residual = |debit total| − Σ(itemised ILS charge amounts).
+ * Since the network settles FX at Isracard's own ILS figure (verified: Google
+ * ₪57.58, Upstash ₪61.21 — both batches' residuals matched their granular to the
+ * agora), we attribute a batch's residual to the single unmatched FX granular
+ * charge whose ILS |chargedAmount| equals it, within the settlement window, and
+ * stamp that charge's real bank charge date + mark it `bankSettled`.
+ *
+ * CONSERVATIVE: only a residual that equals EXACTLY ONE eligible FX granular is
+ * attributed (a multi-FX batch's residual is a sum that matches no single
+ * charge, so it's left to the lag — never a wrong guess). Mutates in place.
+ */
+export function matchFxResidualsToGranular(
+  granular: Transaction[],
+  batches: FxResidualBatch[],
+): { updated: number; report: string[] } {
+  const report: string[] = [];
+  let updated = 0;
+  const consumed = new Set<number>();
+
+  for (const batch of batches) {
+    const ilsMinor = batch.expenses.reduce(
+      (s, e) => s + amountKeyMinor(e.chargeAmount),
+      0,
+    );
+    const residual = batch.totalMinor - ilsMinor;
+    if (residual < FX_RESIDUAL_MIN_MINOR) continue; // no FX / rounding noise
+
+    const chargeCal = batch.chargeDateIso.slice(0, 10); // YYYY-MM-DD
+    const matches = granular
+      .map((g, i) => ({ g, i }))
+      .filter(({ g, i }) => {
+        if (consumed.has(i)) return false;
+        if (!g.originalCurrency || g.originalCurrency === "ILS") return false;
+        if ((g as Transaction & { bankSettled?: boolean }).bankSettled)
+          return false;
+        if (amountKeyMinor(g.chargedAmount) !== residual) return false;
+        const gap = calDayGap(toJerusalemDate(g.date), chargeCal);
+        return (
+          gap >= FX_SETTLEMENT_MIN_LAG_DAYS && gap <= FX_SETTLEMENT_MAX_LAG_DAYS
+        );
+      });
+
+    if (matches.length !== 1) {
+      if (matches.length > 1)
+        report.push(
+          `fx residual ₪${(residual / 100).toFixed(2)} @ ${chargeCal}: ${matches.length} candidates — left to lag`,
+        );
+      continue;
+    }
+
+    const { g, i } = matches[0];
+    consumed.add(i);
+    g.processedDate = batch.chargeDateIso;
+    (g as Transaction & { bankSettled?: boolean }).bankSettled = true;
+    updated++;
+    report.push(
+      `fx settled: ${g.description?.trim()} ₪${(residual / 100).toFixed(2)} -> charge ${chargeCal}`,
+    );
+  }
+
+  return { updated, report };
+}
+
 /**
  * Derive the drill-down request ref for a FIBI `NNNN - ישראכרט` settlement debit.
  *
@@ -253,21 +344,47 @@ export async function enrichFibiCardChargeDates(
 ): Promise<MatchResult> {
   const empty: MatchResult = { updated: 0, unmatched: [], report: [] };
   try {
-    const refs = settlementDebits
-      .map(settlementRefFromDebit)
-      .filter((r): r is FibiSettlementRef => r !== null);
-    if (refs.length === 0) {
+    const pairs = settlementDebits
+      .map((debit) => ({ debit, ref: settlementRefFromDebit(debit) }))
+      .filter(
+        (p): p is { debit: Transaction; ref: FibiSettlementRef } =>
+          p.ref !== null,
+      );
+    if (pairs.length === 0) {
       logger("no resolvable Isracard settlement debits; skipping enrichment");
       return empty;
     }
 
-    const expenses = await fetchFibiCardExpenses(browserContext, refs);
-    if (expenses.length === 0) {
+    const groups = await fetchFibiCardExpenses(
+      browserContext,
+      pairs.map((p) => p.ref),
+    );
+    if (groups.length === 0) {
       logger("no drill-down expenses returned; skipping enrichment");
       return empty;
     }
 
-    const result = matchChargeDatesToGranular(isracardGranular, expenses);
+    // ILS charges: itemised in the drill-down, matched by merchant+amount+date.
+    const allExpenses = groups.flatMap((g) => g.expenses);
+    const result = matchChargeDatesToGranular(isracardGranular, allExpenses);
+
+    // FX charges: not itemised — recovered per batch as the residual (debit
+    // total − Σ itemised ILS) and attributed to the single matching FX granular.
+    // Only when groups line up 1:1 with the debits (so residuals are trustworthy).
+    if (groups.length === pairs.length) {
+      const fx = matchFxResidualsToGranular(
+        isracardGranular,
+        pairs.map((p, i) => ({
+          chargeDateIso: p.debit.date,
+          totalMinor: amountKeyMinor(p.debit.chargedAmount),
+          expenses: groups[i].expenses,
+        })),
+      );
+      result.updated += fx.updated;
+      result.report.push(...fx.report);
+      logger(`fx settled ${fx.updated} charge(s) via residual`);
+    }
+
     logger(
       `enriched ${result.updated} charge date(s); ${result.unmatched.length} unmatched`,
     );
