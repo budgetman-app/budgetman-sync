@@ -204,12 +204,12 @@ describe("planActualUpsert", () => {
       imported_id: BASE,
       amount: -6004,
       cleared: false,
-      notes: PENDING_NOTE,
+      notes: "", // owner-only field — sync writes empty
       payee_name: "UPSTASH",
     });
   });
 
-  it("settles a pending twin in place: no duplicate, upgraded id, delta note", () => {
+  it("settles a pending twin in place: no duplicate, upgraded id, notes untouched", () => {
     const existing = [existingPending({ amount: -29500 })]; // pending estimate ₪295.00
     const { adds, updates } = planActualUpsert(
       [settled({ amount: -29644 })], // final ₪296.44
@@ -222,8 +222,20 @@ describe("planActualUpsert", () => {
       amount: -29644,
       cleared: true,
       imported_id: SETTLED_ID,
-      notes: "settled ₪295.00→₪296.44",
     });
+    expect("notes" in updates[0].fields).toBe(false); // never overwrites owner notes
+  });
+
+  it("preserves the owner's own note through a settle (never in the update)", () => {
+    const existing = [
+      existingPending({ amount: -29500, notes: "my receipt #42" }),
+    ];
+    const { updates } = planActualUpsert(
+      [settled({ amount: -29644 })],
+      existing,
+    );
+    expect(updates).toHaveLength(1);
+    expect("notes" in updates[0].fields).toBe(false); // owner's "my receipt #42" untouched
     // category is never part of an update
     expect("category" in updates[0].fields).toBe(false);
   });
@@ -340,17 +352,15 @@ describe("planActualUpsert", () => {
     expect(updates).toHaveLength(0);
   });
 
-  it("updates a pending charge whose estimate changed", () => {
+  it("updates a pending charge whose estimate changed (amount only, no note)", () => {
     const { adds, updates } = planActualUpsert(
       [pending({ amount: -6100 })],
       [existingPending({ amount: -6004 })],
     );
     expect(adds).toHaveLength(0);
     expect(updates).toHaveLength(1);
-    expect(updates[0].fields).toEqual({
-      amount: -6100,
-      notes: `${PENDING_NOTE} ₪60.04→₪61.00`,
-    });
+    expect(updates[0].fields).toEqual({ amount: -6100 });
+    expect("notes" in updates[0].fields).toBe(false); // owner-only field
     expect(updates[0].fields.cleared).toBeUndefined();
   });
 
@@ -483,7 +493,7 @@ describe("card pending -> settled reconciliation (domestic, cross-source)", () =
       imported_id: CARD,
       amount: -16990,
       cleared: false,
-      notes: PENDING_NOTE,
+      notes: "", // owner-only field
       payee_name: "דירקט אושר-ישראכרט",
     });
   });

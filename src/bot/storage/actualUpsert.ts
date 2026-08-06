@@ -10,8 +10,9 @@ import { hash } from "hash-it";
 // invariant pending->settled (only the ILS estimate moves and the voucher is
 // assigned late). So a pending row and its settled twin share a stable "base
 // key" used as the pending row's imported_id. On settle we find that twin and
-// update it in place — new amount, cleared, upgraded imported_id, a change note
-// — WITHOUT ever touching its category.
+// update it in place — new amount, cleared, upgraded imported_id — WITHOUT ever
+// touching its category OR its notes: the notes field is the owner's to fill,
+// so the sync never writes it (new rows start empty; updates leave it alone).
 //
 // Drift tolerance (non-card path): FIBI mutates a pending row's DATE (e.g. a
 // reserve credit re-stamped 08-02 -> 08-03) and its DESCRIPTION (e.g. a settled
@@ -89,6 +90,9 @@ export interface UpsertPlan {
   report: string[];
 }
 
+/** LEGACY marker the sync used to stamp on pending rows. No longer written (the
+ * notes field is owner-only); kept so old rows carrying it can be recognized and
+ * cleaned. */
 export const PENDING_NOTE = "PENDING";
 
 /** Pending<->settled twin match window: FIBI drifts the pending date by a day
@@ -287,7 +291,6 @@ export function planActualUpsert(
         const fields: PlannedUpdate["fields"] = {};
         if (twin.amount !== tx.amount) {
           fields.amount = tx.amount;
-          fields.notes = `${PENDING_NOTE} ₪${ils(twin.amount)}→₪${ils(tx.amount)}`;
           report.push(
             `pending updated: ${tx.payeeName} ₪${ils(twin.amount)}→₪${ils(tx.amount)}`,
           );
@@ -314,7 +317,7 @@ export function planActualUpsert(
           amount: tx.amount,
           payee_name: tx.payeeName,
           cleared: false,
-          notes: PENDING_NOTE,
+          notes: "", // owner-only field — sync never writes it
         });
         report.push(`new pending: ${tx.payeeName} ₪${ils(tx.amount)}`);
       }
@@ -347,7 +350,7 @@ export function planActualUpsert(
             amount: tx.amount,
             cleared: true,
             imported_id: tx.settledImportedId,
-            notes: `settled ₪${ils(twin.amount)}→₪${ils(tx.amount)}`,
+            // notes deliberately untouched — preserve the owner's own text.
             ...(options.updateDateOnSettle ? { date: tx.date } : {}),
           },
         });

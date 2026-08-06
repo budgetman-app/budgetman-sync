@@ -123,7 +123,7 @@ describe("ActualBudgetStorage upsert (pending -> settled)", () => {
     let rows = storeOf();
     expect(rows).toHaveLength(1);
     expect(rows[0].cleared).toBe(false);
-    expect(rows[0].notes).toBe("PENDING");
+    expect(rows[0].notes).toBe(""); // owner-only field, sync writes empty
     expect(rows[0].amount).toBe(-6004);
     const pendingImportedId = rows[0].imported_id;
     expect(pendingImportedId.startsWith("pend:")).toBe(true);
@@ -145,7 +145,7 @@ describe("ActualBudgetStorage upsert (pending -> settled)", () => {
     expect(rows).toHaveLength(1); // no duplicate
     expect(rows[0].amount).toBe(-5920); // final amount
     expect(rows[0].cleared).toBe(true); // cleared flipped
-    expect(rows[0].notes).toBe("settled ₪60.04→₪59.20"); // delta note
+    expect(rows[0].notes).toBe(""); // notes left to the owner
     expect(rows[0].imported_id).not.toBe(pendingImportedId); // upgraded id
     expect(rows[0].category).toBe("cat-groceries"); // category preserved
 
@@ -191,7 +191,7 @@ describe("ActualBudgetStorage upsert (pending -> settled)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].amount).toBe(-13000);
     expect(rows[0].cleared).toBe(true);
-    expect(rows[0].notes).toBe("settled ₪130.00→₪130.00");
+    expect(rows[0].notes).toBe(""); // notes left to the owner
     expect(rows[0].category).toBe("cat-food");
   });
 });
@@ -255,7 +255,7 @@ describe("ActualBudgetStorage clearOnChargeDate (card lifecycle, #14)", () => {
     expect(rows[0].category).toBe("cat-groceries"); // preserved
   });
 
-  it("records the settle note in place on collapse", async () => {
+  it("leaves the notes field empty on collapse (owner-only)", async () => {
     await save(
       [card({ status: TransactionStatuses.Pending, uniqueId: "p" })],
       cfg,
@@ -272,7 +272,7 @@ describe("ActualBudgetStorage clearOnChargeDate (card lifecycle, #14)", () => {
     );
     const rows = storeOf();
     expect(rows).toHaveLength(1);
-    expect(rows[0].notes).toBe("settled ₪28.00→₪28.00");
+    expect(rows[0].notes).toBe(""); // notes left to the owner
   });
 
   it("a settled charge with no pending twin adds directly on the charge date", async () => {
@@ -346,7 +346,7 @@ describe("ActualBudgetStorage clearOnChargeDate future-charge guard (#14)", () =
     expect(rows).toHaveLength(1);
     expect(rows[0].cleared).toBe(false); // NOT prematurely cleared
     expect(rows[0].date).toBe(toJerusalemDate(purchase)); // purchase, not the future date
-    expect(rows[0].notes).toBe("PENDING");
+    expect(rows[0].notes).toBe(""); // owner-only field, sync writes empty
   });
 
   it("(b) past charge date -> cleared on the real charge date", async () => {
@@ -547,7 +547,7 @@ describe("ActualBudgetStorage anchorFxToFibi", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].cleared).toBe(false); // kept pending — FIBI still holds it
     expect(rows[0].amount).toBe(-6358); // FIBI's hold amount, not Isracard's -6114
-    expect(rows[0].notes).toBe("PENDING");
+    expect(rows[0].notes).toBe(""); // owner-only field, sync writes empty
     expect(rows[0].imported_id.startsWith("pend:sig_")).toBe(true);
     expect(rows[0].payee_name).toBe("UPSTASH"); // merchant untouched
   });
@@ -728,7 +728,7 @@ describe("ActualBudgetStorage clearOnFibiSettlement", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].cleared).toBe(false); // FIBI hasn't posted it yet
     expect(rows[0].date).toBe(toJerusalemDate(RECENT)); // purchase date
-    expect(rows[0].notes).toBe("PENDING");
+    expect(rows[0].notes).toBe(""); // owner-only field, sync writes empty
     expect(rows[0].amount).toBe(-10000); // Isracard's own amount
   });
 
