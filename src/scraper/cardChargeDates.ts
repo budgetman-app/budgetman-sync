@@ -260,7 +260,9 @@ export function matchFxResidualsToGranular(
     const residual = batch.totalMinor - ilsMinor;
     if (residual < FX_RESIDUAL_MIN_MINOR) continue; // no FX / rounding noise
 
-    const chargeCal = batch.chargeDateIso.slice(0, 10); // YYYY-MM-DD
+    // Jerusalem calendar date — FIBI stamps at 21:00Z (Israel midnight), so the
+    // raw UTC date is a day early; compare/log against the same TZ as the granular.
+    const chargeCal = toJerusalemDate(batch.chargeDateIso); // YYYY-MM-DD
     const matches = granular
       .map((g, i) => ({ g, i }))
       .filter(({ g, i }) => {

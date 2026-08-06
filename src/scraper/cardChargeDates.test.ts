@@ -489,4 +489,27 @@ describe("matchFxResidualsToGranular", () => {
     );
     expect(res.updated).toBe(0);
   });
+
+  it("uses the Jerusalem date for a 21:00Z-stamped batch (FIBI midnight)", () => {
+    // FIBI stamps settlement debits at 21:00Z = Israel midnight; the charge date
+    // is the NEXT calendar day in Asia/Jerusalem.
+    const up = granular({
+      originalCurrency: "USD",
+      chargedAmount: -61.21,
+      date: "2026-08-03T00:00:00.000Z",
+    });
+    const res = matchFxResidualsToGranular(
+      [up],
+      [
+        {
+          chargeDateIso: "2026-08-04T21:00:00.000Z",
+          totalMinor: 6121,
+          expenses: [],
+        },
+      ],
+    );
+    expect(res.updated).toBe(1);
+    expect(res.report[0]).toContain("2026-08-05"); // Jerusalem day, not 08-04 UTC
+    expect(up.processedDate).toBe("2026-08-04T21:00:00.000Z"); // raw ISO; TZ-converted downstream
+  });
 });
