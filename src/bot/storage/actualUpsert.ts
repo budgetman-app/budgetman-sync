@@ -32,6 +32,19 @@ export interface ExistingActualTx {
   notes: string | null;
   /** YYYY-MM-DD. Used to window-match a signature-keyed twin across date drift. */
   date?: string;
+  /** Raw imported payee text; only read to refresh a stale "טרם נקלט" placeholder. */
+  imported_payee?: string | null;
+}
+
+/**
+ * Isracard stamps this placeholder as the merchant when a charge settles before
+ * its name resolves; a later scrape carries the real merchant. We refresh the
+ * payee off that later scrape, but ONLY when the stored one is still the
+ * placeholder — a real or owner-edited payee is never touched.
+ */
+export const PLACEHOLDER_PAYEE_RE = /^\s*טרם\s*נקלט\s*$/;
+export function isPlaceholderPayee(name: string | null | undefined): boolean {
+  return PLACEHOLDER_PAYEE_RE.test(name ?? "");
 }
 
 /** A scraped transaction normalized for planning. Amounts are integer minor units. */
@@ -80,6 +93,12 @@ export interface PlannedUpdate {
      * date so cleared rows line up with FIBI's posted running balance.
      */
     date?: string;
+    /**
+     * A NAME (not an id) for a payee refresh — only emitted to replace a stale
+     * "טרם נקלט" placeholder with the now-resolved merchant. The provider resolves
+     * it to a payee id before applying.
+     */
+    payeeName?: string;
   };
 }
 
@@ -332,11 +351,25 @@ export function planActualUpsert(
         // finalize it IN PLACE: flip cleared (and fix the date under
         // updateDateOnSettle) without touching amount/category/notes/imported_id.
         const dateOk = !options.updateDateOnSettle || prior.date === tx.date;
-        if (prior.cleared && dateOk) continue; // already correct -> no-op
+        // Refresh a stale "טרם נקלט" placeholder to the now-resolved merchant.
+        const refreshPayee =
+          isPlaceholderPayee(prior.imported_payee) &&
+          !isPlaceholderPayee(tx.payeeName) &&
+          tx.payeeName.trim() !== ""
+            ? tx.payeeName
+            : undefined;
+        if (prior.cleared && dateOk) {
+          if (refreshPayee) {
+            updates.push({ id: prior.id, fields: { payeeName: refreshPayee } });
+            report.push(`payee resolved: טרם נקלט -> ${refreshPayee}`);
+          }
+          continue; // otherwise a true no-op
+        }
         const fields: PlannedUpdate["fields"] = { cleared: true };
         if (options.updateDateOnSettle && prior.date !== tx.date) {
           fields.date = tx.date;
         }
+        if (refreshPayee) fields.payeeName = refreshPayee;
         updates.push({ id: prior.id, fields });
         report.push(`cleared stuck row: ${tx.payeeName} ₪${ils(tx.amount)}`);
         continue;

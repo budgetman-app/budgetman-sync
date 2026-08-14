@@ -50,8 +50,24 @@ export class ActualBudgetStorage implements TransactionStorage {
   // (integer minor units) taken from FIBI's auth hold. Empty unless
   // `anchorFxToFibi` is on. Keyed by identity so no other storage is affected.
   private fxOverrides = new Map<TransactionRow, number>();
+  // payee name -> id cache for the placeholder-payee refresh (lazy-loaded).
+  private payeeIdByName = new Map<string, string>();
 
   constructor(private config: MoneymanConfig) {}
+
+  /** Find-or-create a payee id for a name (cached). Used only to apply a
+   * placeholder-payee refresh update. */
+  private async resolvePayeeId(name: string): Promise<string> {
+    if (this.payeeIdByName.size === 0) {
+      for (const p of await actualApi.getPayees())
+        if (p?.name) this.payeeIdByName.set(p.name, p.id);
+    }
+    const hit = this.payeeIdByName.get(name);
+    if (hit) return hit;
+    const id = await actualApi.createPayee({ name });
+    this.payeeIdByName.set(name, id);
+    return id;
+  }
 
   canSave() {
     return Boolean(this.config.storage.actual);
@@ -532,8 +548,21 @@ export class ActualBudgetStorage implements TransactionStorage {
     // as a future-dated charge; the trigger is "FIBI still holds it".
     const fibiHolding = this.fxOverrides.has(tx);
 
+    // Owner's clearing rule (under clearOnFibiSettlement): anything that shows up
+    // in FIBI — INCLUDING a FIBI-direct row that is still pending (e.g. a ביטוח
+    // credit while it settles) — is CLEARED; only a credit-card expense FIBI has
+    // not debited yet stays uncleared. So the pending flag keeps a row uncleared
+    // ONLY for card charges; non-card FIBI rows always clear. Other clearing
+    // configs keep the original (every-pending-row-uncleared) behavior.
+    const pendingKeepsUncleared = clearOnFibiSettlement
+      ? isCardChargeRow && isPending
+      : isPending;
+
     const effectivePending =
-      isPending || chargeInFuture || fibiHolding || fibiSettlementPending;
+      pendingKeepsUncleared ||
+      chargeInFuture ||
+      fibiHolding ||
+      fibiSettlementPending;
 
     // The Actual ROW date. A settled domestic card charge that has actually been
     // charged (charge date <= today) is dated on that real bank charge date so
@@ -618,6 +647,7 @@ export class ActualBudgetStorage implements TransactionStorage {
         cleared: Boolean(e.cleared),
         notes: e.notes ?? null,
         date: e.date, // for signature-key window matching
+        imported_payee: e.imported_payee ?? null, // for placeholder refresh
       }));
 
       const plan = planActualUpsert(incoming, existing, {
@@ -647,7 +677,12 @@ export class ActualBudgetStorage implements TransactionStorage {
       }
 
       for (const u of plan.updates) {
-        await actualApi.updateTransaction(u.id, u.fields);
+        // A `payeeName` field is a NAME (placeholder refresh) — resolve it to a
+        // payee id, which is what updateTransaction accepts.
+        const { payeeName, ...fields } = u.fields;
+        const resolved: Record<string, unknown> = { ...fields };
+        if (payeeName) resolved.payee = await this.resolvePayeeId(payeeName);
+        await actualApi.updateTransaction(u.id, resolved);
       }
       stats.existing += plan.updates.length;
     }

@@ -1,6 +1,7 @@
 import {
   computeCardKey,
   computeStableKey,
+  isPlaceholderPayee,
   planActualUpsert,
   PENDING_NOTE,
   type ExistingActualTx,
@@ -577,5 +578,52 @@ describe("card pending -> settled reconciliation (domestic, cross-source)", () =
     const plan = planActualUpsert([granular()], existing);
     expect(plan.adds).toHaveLength(0);
     expect(plan.updates).toHaveLength(0);
+  });
+});
+
+describe("placeholder payee refresh (טרם נקלט)", () => {
+  const settledRow = (over = {}) => ({
+    id: "r",
+    imported_id: SETTLED_ID,
+    amount: -1050,
+    cleared: true,
+    notes: "",
+    date: "2026-08-11",
+    imported_payee: "טרם נקלט",
+    ...over,
+  });
+
+  it("isPlaceholderPayee matches only the טרם נקלט placeholder", () => {
+    expect(isPlaceholderPayee("טרם נקלט")).toBe(true);
+    expect(isPlaceholderPayee("  טרם נקלט  ")).toBe(true);
+    expect(isPlaceholderPayee("מקס פראם")).toBe(false);
+    expect(isPlaceholderPayee("")).toBe(false);
+    expect(isPlaceholderPayee(null)).toBe(false);
+  });
+
+  it("refreshes a settled row's stale placeholder to the resolved merchant", () => {
+    const { adds, updates } = planActualUpsert(
+      [settled({ amount: -1050, payeeName: "מקס פראם מקס איט ניכ" })],
+      [settledRow()],
+    );
+    expect(adds).toHaveLength(0);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].fields).toEqual({ payeeName: "מקס פראם מקס איט ניכ" });
+  });
+
+  it("does NOT touch a real (already-resolved) payee — stays a no-op", () => {
+    const { updates } = planActualUpsert(
+      [settled({ amount: -1050, payeeName: "מקס פראם מקס איט ניכ" })],
+      [settledRow({ imported_payee: "מקס פראם" })],
+    );
+    expect(updates).toHaveLength(0);
+  });
+
+  it("does not refresh when the incoming name is itself the placeholder", () => {
+    const { updates } = planActualUpsert(
+      [settled({ amount: -1050, payeeName: "טרם נקלט" })],
+      [settledRow()],
+    );
+    expect(updates).toHaveLength(0);
   });
 });
