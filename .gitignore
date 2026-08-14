@@ -8,3 +8,5 @@ moneyman.conf.jsonc
 local_config/
 dst/
 output
+# never commit local scraper configs (they carry bank credentials)
+*.conf.jsonc
