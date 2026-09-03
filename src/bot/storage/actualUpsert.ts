@@ -58,6 +58,18 @@ export interface IncomingTx {
   /** imported_id to use once settled (moneyman's uniqueId/voucher-based hash). */
   settledImportedId: string;
   isPending: boolean;
+  /**
+   * Desired Actual `cleared` state for a row routed through the PENDING path
+   * (base-key identity) — the decoupling that lets a row be imported cleared yet
+   * still keyed on the stable base key. Only consulted on the pending branch (the
+   * settled branch always clears). Defaults to false, so every existing pending
+   * row (card/FX) is byte-for-byte unchanged. Set true for a FIBI-direct non-card
+   * row under `clearOnFibiSettlement`: it appears on FIBI (=> cleared) but its
+   * moneyman uniqueId is NOT stable pending->settled (FIBI assigns the reference/
+   * value-date late), so it must anchor to the stable `pend:sig_` key or its
+   * settled twin imports as a second row (the recurring ביטוח-לאומי duplicate).
+   */
+  cleared?: boolean;
   amount: number;
   date: string; // YYYY-MM-DD — the Actual row date
   /**
@@ -326,6 +338,13 @@ export function planActualUpsert(
             `pending re-dated: ${tx.payeeName} ${twin.date}→${matchDate}`,
           );
         }
+        // Keep a base-key-anchored row at its desired cleared state (a FIBI-direct
+        // non-card credit is imported cleared but routed here for stable identity).
+        // For genuine card/FX pending rows tx.cleared is false and so is the twin,
+        // so this never fires — their behavior is unchanged.
+        if (Boolean(tx.cleared) !== twin.cleared) {
+          fields.cleared = Boolean(tx.cleared);
+        }
         if (Object.keys(fields).length > 0) {
           updates.push({ id: twin.id, fields });
         }
@@ -335,7 +354,7 @@ export function planActualUpsert(
           date: tx.date,
           amount: tx.amount,
           payee_name: tx.payeeName,
-          cleared: false,
+          cleared: Boolean(tx.cleared),
           notes: "", // owner-only field — sync never writes it
         });
         report.push(`new pending: ${tx.payeeName} ₪${ils(tx.amount)}`);

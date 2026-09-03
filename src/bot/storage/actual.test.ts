@@ -686,8 +686,8 @@ describe("ActualBudgetStorage clearOnFibiSettlement", () => {
   const cfg = { clearOnFibiSettlement: true };
 
   // Relative dates so the "older than the settle lag" boundary stays valid over
-  // time. RECENT (< FIBI_SETTLE_LAG_DAYS) stays uncleared while unmatched; OLD
-  // (>= lag) clears via the time-lag fallback.
+  // time. RECENT (< FIBI_SETTLE_LAG_DAYS) stays uncleared while it has not appeared
+  // on FIBI; OLD (>= lag) clears via the 0041-only settle fallback (never 5104).
   const DAY = 86_400_000;
   const isoOffset = (days: number) =>
     new Date(Date.now() + days * DAY).toISOString();
@@ -695,8 +695,9 @@ describe("ActualBudgetStorage clearOnFibiSettlement", () => {
   const OLD = isoOffset(-10); // >= 5-day lag
   const CHARGE = isoOffset(-3); // a past FIBI charge date
 
-  // A domestic Isracard card charge (isCardCharge via companyId). Default
-  // processedDate is the FUTURE monthly placeholder the scraper reports.
+  // A domestic Isracard card charge (isCardCharge via companyId). Default account
+  // "0041" (direct debit). Default processedDate is the FUTURE monthly placeholder
+  // the scraper reports.
   const cardTx = (over: Partial<TransactionRow>) =>
     row({
       description: "Upapp",
@@ -706,6 +707,22 @@ describe("ActualBudgetStorage clearOnFibiSettlement", () => {
       status: TransactionStatuses.Completed,
       date: RECENT,
       processedDate: isoOffset(15),
+      ...over,
+    });
+
+  // A FIBI domestic auth-hold ("דירקט אושר-ישראכרט") for the same |amount|, from
+  // the checking scrape. Excluded from import; used only as an "on FIBI" signal.
+  const fibiHold = (over: Partial<TransactionRow> = {}) =>
+    row({
+      account: "477872",
+      companyId: "beinleumi" as TransactionRow["companyId"],
+      description: "דירקט אושר-ישראכרט",
+      originalCurrency: "ILS",
+      originalAmount: -100,
+      chargedAmount: -100,
+      status: TransactionStatuses.Pending,
+      date: RECENT,
+      uniqueId: "fibi-hold",
       ...over,
     });
 
@@ -732,12 +749,74 @@ describe("ActualBudgetStorage clearOnFibiSettlement", () => {
     expect(rows[0].amount).toBe(-10000); // Isracard's own amount
   });
 
-  it("(lag) unmatched card charge OLDER than the settle lag clears on the purchase date", async () => {
-    await save([cardTx({ date: OLD, uniqueId: "lag" })], cfg); // unmatched, old
+  it("(lag) unmatched OLD 0041 charge clears via the 0041-only settle fallback", async () => {
+    await save([cardTx({ date: OLD, uniqueId: "lag" })], cfg); // 0041, unmatched, old
     const rows = storeOf();
     expect(rows).toHaveLength(1);
-    expect(rows[0].cleared).toBe(true); // FIBI has certainly posted it by now
+    expect(rows[0].cleared).toBe(true); // 0041 has certainly posted to FIBI by now
     expect(rows[0].date).toBe(toJerusalemDate(OLD)); // dated on the purchase date
+  });
+
+  it("(5104) unmatched OLD 5104 monthly charge stays UNCLEARED (not on FIBI yet)", async () => {
+    // The reported bug: a 5104 monthly-credit charge does not appear on FIBI until
+    // its statement, so the age fallback must NOT clear it — only 0041 ages out.
+    await save([cardTx({ date: OLD, account: "5104", uniqueId: "m5104" })], {
+      ...cfg,
+      accounts: { "0041": "act-1", "5104": "act-1" },
+    });
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false); // stays uncleared until the monthly statement
+    expect(rows[0].date).toBe(toJerusalemDate(OLD)); // on the purchase date
+  });
+
+  it("(hold) recent 0041 charge FIBI is auth-HOLDING becomes CLEARED", async () => {
+    // The other reported bug: a recent 0041 charge FIBI is currently holding was
+    // left uncleared because domestic holds were not detected. Now it clears. The
+    // FIBI auth is excluded from import (as in the live config) but pooled as the
+    // "on FIBI" signal.
+    await save([cardTx({ uniqueId: "h" }), fibiHold({ uniqueId: "h-hold" })], {
+      ...cfg,
+      excludeDescriptions: ["אושר-ישרא"],
+    });
+    const rows = storeOf();
+    expect(rows).toHaveLength(1); // the FIBI auth is excluded, not imported
+    expect(rows[0].payee_name).toBe("Upapp");
+    expect(rows[0].cleared).toBe(true); // appears on FIBI as a live hold -> cleared
+    expect(rows[0].date).toBe(toJerusalemDate(RECENT)); // purchase date
+    expect(rows[0].amount).toBe(-10000);
+  });
+
+  it("(hold) the unified rule is not card-type-branched: a held 5104 charge clears too", async () => {
+    // If FIBI is already holding a 5104 charge, it IS on FIBI -> cleared, even
+    // though the age fallback would never clear a 5104. Same "appears on FIBI" check.
+    await save(
+      [
+        cardTx({ account: "5104", uniqueId: "h5" }),
+        fibiHold({ uniqueId: "h5-hold" }),
+      ],
+      {
+        ...cfg,
+        accounts: { "5104": "act-1" },
+        excludeDescriptions: ["אושר-ישרא"],
+      },
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+  });
+
+  it("(hold) a domestic hold does not clear a charge with a different amount", async () => {
+    await save(
+      [
+        cardTx({ chargedAmount: -250, originalAmount: -250, uniqueId: "hx" }),
+        fibiHold({ uniqueId: "hx-hold" }), // holds ₪100, not ₪250
+      ],
+      { ...cfg, excludeDescriptions: ["אושר-ישרא"] },
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false); // no matching hold, recent, not aged -> uncleared
   });
 
   it("(c) unmatched RECENT -> matched next run flips to cleared: single row, no dupe", async () => {
@@ -808,6 +887,139 @@ describe("ActualBudgetStorage clearOnFibiSettlement", () => {
     const rows = storeOf();
     expect(rows).toHaveLength(1);
     expect(rows[0].cleared).toBe(true); // non-card clears normally
+  });
+});
+
+describe("ActualBudgetStorage FIBI-direct non-card credit dedup (pending->settled)", () => {
+  beforeEach(() => resetStore());
+
+  // The recurring bug: a FIBI-direct National-Insurance / reserve-duty credit
+  // ("ביטוח לאומי מיל") first appears value-dated ("*יזום", posts next business
+  // day) with no reference, then settles with a late-assigned identifier. Its
+  // moneyman uniqueId therefore differs between the two views, so hash(uniqueId)
+  // -> settledImportedId differs and the settled twin imported as a SECOND row.
+  // Under clearOnFibiSettlement it clears immediately (it is on FIBI), so it
+  // must anchor to its stable pend:sig_ signature key to collapse to ONE row.
+  const cfg = { clearOnFibiSettlement: true, accounts: { "477872": "act-1" } };
+
+  // A FIBI checking-account (beinleumi) NON-card credit. Positive amount.
+  const credit = (over: Partial<TransactionRow>) =>
+    row({
+      account: "477872",
+      companyId: "beinleumi" as TransactionRow["companyId"],
+      description: "ביטוח לאומי מיל",
+      originalCurrency: "ILS",
+      originalAmount: 888,
+      chargedAmount: 888,
+      date: "2026-08-16T21:00:00.000Z", // 21:00Z == midnight Israel -> 2026-08-17
+      processedDate: "2026-08-16T21:00:00.000Z",
+      ...over,
+    });
+
+  it("ביטוח לאומי: pending (no ref) then settled (ref assigned) collapses to ONE cleared row", async () => {
+    // 1) value-dated pending view: identifier absent -> uniqueId from desc+memo.
+    await save(
+      [credit({ status: TransactionStatuses.Pending, uniqueId: "bi-pending" })],
+      cfg,
+    );
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true); // appears on FIBI -> cleared even while pending
+    expect(rows[0].amount).toBe(88800);
+    // Anchored to the stable signature key, NOT the volatile settledImportedId.
+    expect(rows[0].imported_id.startsWith("pend:sig_")).toBe(true);
+    const stableId = rows[0].imported_id;
+
+    // owner categorizes it
+    rows[0].category = "cat-income";
+
+    // 2) settled view: a reference is now assigned -> a DIFFERENT uniqueId.
+    await save(
+      [
+        credit({
+          status: TransactionStatuses.Completed,
+          identifier: "REF-889900",
+          uniqueId: "bi-settled",
+        }),
+      ],
+      cfg,
+    );
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // no duplicate (the bug: this used to be 2)
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].imported_id).toBe(stableId); // identity stayed on the stable key
+    expect(rows[0].category).toBe("cat-income"); // category preserved
+  });
+
+  it("collapses to ONE row even when FIBI re-stamps the value date on settle", async () => {
+    await save(
+      [credit({ status: TransactionStatuses.Pending, uniqueId: "d-pending" })],
+      cfg,
+    );
+    expect(storeOf()).toHaveLength(1);
+
+    // settled a day later (FIBI drifts the value date within the collapse window)
+    await save(
+      [
+        credit({
+          status: TransactionStatuses.Completed,
+          identifier: "REF-DRIFT",
+          uniqueId: "d-settled",
+          date: "2026-08-17T21:00:00.000Z", // -> 2026-08-18 Israel (1 day drift)
+          processedDate: "2026-08-17T21:00:00.000Z",
+        }),
+      ],
+      cfg,
+    );
+    expect(storeOf()).toHaveLength(1); // still one row across the date drift
+  });
+
+  it("two genuinely-distinct same-amount credits on different dates stay TWO rows", async () => {
+    // Both +888, but 10 days apart -> outside the collapse window -> not merged.
+    await save(
+      [
+        credit({
+          status: TransactionStatuses.Completed,
+          identifier: "REF-A",
+          uniqueId: "c-a",
+          date: "2026-08-16T21:00:00.000Z", // -> 2026-08-17
+        }),
+      ],
+      cfg,
+    );
+    await save(
+      [
+        credit({
+          status: TransactionStatuses.Completed,
+          identifier: "REF-B",
+          uniqueId: "c-b",
+          date: "2026-08-26T21:00:00.000Z", // -> 2026-08-27 (10 days later)
+        }),
+      ],
+      cfg,
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(2); // distinct credits are not over-collapsed
+  });
+
+  it("is idempotent: re-scraping the settled credit changes nothing", async () => {
+    const settled = () =>
+      credit({
+        status: TransactionStatuses.Completed,
+        identifier: "REF-IDEM",
+        uniqueId: "idem",
+      });
+    await save([settled()], cfg);
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    const before = { ...rows[0] };
+
+    await save([settled()], cfg);
+    rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].imported_id).toBe(before.imported_id);
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].amount).toBe(before.amount);
   });
 });
 

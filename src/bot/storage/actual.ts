@@ -24,14 +24,24 @@ import { assignFxAnchors, type FibiAuth } from "./fxAnchor.js";
 
 const logger = createLogger("ActualBudgetStorage");
 
-// FIBI posts card settlements within ~2-3 days of the charge. Under
-// `clearOnFibiSettlement`, a card charge the enrichment could NOT confirm (no
-// drill-down match — e.g. a settlement outside the scrape window) still clears
-// once it is at least this many days old, so the unconfirmable tail never sits
-// uncleared forever and breaks the reconciliation formula. 5 is a safe margin so
-// we never clear ahead of FIBI. `bankSettled` always wins (precise charge date);
-// this lag is only a floor.
+// FIBI posts card 0041 (direct-debit) settlements within ~2-3 days of the charge.
+// Under `clearOnFibiSettlement`, the authoritative "appears on FIBI" signals are a
+// settlement drill-down match (`bankSettled`) and a live domestic auth-hold match
+// (`fibiDomesticHolds`). This lag is a NARROW SAFETY FALLBACK, gated to card 0041
+// ONLY (see `isCard0041`): a direct-debit charge reliably posts within ~2-3 days,
+// so if BOTH signals miss it (drill-down outside the scrape window AND the hold
+// already released) and it is at least this many days old, it has certainly
+// posted — clear it so the unconfirmable 0041 tail never breaks the reconciliation
+// formula. NEVER applied to card 5104 (monthly credit): a 5104 charge does not
+// appear on FIBI until its monthly statement, so ageing it out would clear it
+// ahead of FIBI. `bankSettled` always wins (precise charge date); this is a floor.
 const FIBI_SETTLE_LAG_DAYS = 5;
+
+// A FIBI domestic auth-hold appears within ~2-3 days of the purchase; allow a few
+// extra days of slack (and TZ slack the other way) when matching a hold to a
+// charge by |amount| + date. Global best-pair (nearest date) + consume-once keeps
+// same-amount collisions safe.
+const DOMESTIC_HOLD_WINDOW_DAYS = 5;
 
 /** Whole-day (today − date) in Asia/Jerusalem calendar days; negative if future. */
 function daysAgo(date: string, today: string): number {
@@ -50,6 +60,14 @@ export class ActualBudgetStorage implements TransactionStorage {
   // (integer minor units) taken from FIBI's auth hold. Empty unless
   // `anchorFxToFibi` is on. Keyed by identity so no other storage is affected.
   private fxOverrides = new Map<TransactionRow, number>();
+  // Per-save set of DOMESTIC card charges that FIBI is currently auth-HOLDING (a
+  // FIBI "דירקט אושר-ישראכרט" domestic auth matched by |amount| + date). Under the
+  // unified `clearOnFibiSettlement` rule a charge that appears on FIBI — as a
+  // settlement OR a hold — is CLEARED. Empty unless `clearOnFibiSettlement` is on.
+  // Keyed by identity so no other storage is affected. This is the domestic analog
+  // of `fxOverrides`, but it CLEARS the charge (domestic amount is final) rather
+  // than keeping it pending the way the FX hold path does (FX amount still moves).
+  private fibiDomesticHolds = new Set<TransactionRow>();
   // payee name -> id cache for the placeholder-payee refresh (lazy-loaded).
   private payeeIdByName = new Map<string, string>();
 
@@ -92,6 +110,14 @@ export class ActualBudgetStorage implements TransactionStorage {
       this.fxOverrides = this.config.storage.actual?.anchorFxToFibi
         ? this.computeFxAnchors(txns)
         : new Map();
+
+      // Which domestic card charges FIBI is currently holding as an auth. Pooled
+      // from the FULL set BEFORE exclusions (the FIBI auth rows are excluded from
+      // import but used here as a "appears on FIBI" signal, exactly like the FX
+      // auth pool above). Off unless `clearOnFibiSettlement` -> empty -> no-op.
+      this.fibiDomesticHolds = this.config.storage.actual?.clearOnFibiSettlement
+        ? this.computeDomesticHolds(txns)
+        : new Set();
 
       const kept = this.applyDescriptionExclusions(txns, stats);
 
@@ -394,6 +420,105 @@ export class ActualBudgetStorage implements TransactionStorage {
   }
 
   /**
+   * A FIBI (beinleumi) DOMESTIC card auth-hold — the per-purchase authorization
+   * FIBI posts for a direct-debit (0041) card charge (description like
+   * "דירקט אושר-ישראכרט"; ILS `chargedAmount`, no merchant). It is the domestic
+   * twin of {@link isFibiFxAuth}; the two are distinguished by the "מטח" (FX)
+   * token, which the domestic auth never carries. Used ONLY as an "appears on
+   * FIBI" signal (never imported — it is excluded by description).
+   */
+  private isFibiDomesticAuth(tx: TransactionRow): boolean {
+    const desc = tx.description ?? "";
+    return (
+      tx.companyId === CompanyTypes.beinleumi &&
+      tx.status === TransactionStatuses.Pending &&
+      /אושר/.test(desc) &&
+      !/מטח/.test(desc)
+    );
+  }
+
+  /**
+   * The Isracard direct-debit card (0041): it posts to FIBI within ~2-3 days as an
+   * auth-hold then a settlement. The monthly-credit card (5104) does NOT appear on
+   * FIBI until its statement, so the age-based settle fallback must never apply to
+   * it. The card number is the Isracard row's `account` (the config account key,
+   * e.g. "0041"/"5104"); reliable per row, so the fallback can be gated on it.
+   */
+  private isCard0041(tx: TransactionRow): boolean {
+    return (
+      tx.companyId === CompanyTypes.isracard && (tx.account ?? "") === "0041"
+    );
+  }
+
+  /**
+   * Detect which DOMESTIC (ILS) card charges FIBI is currently auth-HOLDING, so
+   * the unified `clearOnFibiSettlement` rule can clear them ("appears on FIBI as a
+   * hold OR settlement -> cleared"). The domestic analog of {@link computeFxAnchors}:
+   * pool the FIBI domestic auth-holds (amount source only — excluded from import),
+   * then match each completed domestic card charge to a hold by |amount| + purchase
+   * date. Domestic ILS amounts do NOT move between auth and settlement, so the
+   * match is on EXACT integer minor units (unlike FX, which needs ratio bands).
+   *
+   * GLOBAL best-pair (nearest date first) with consume-once for both sides, so two
+   * same-amount charges never both claim one hold. Returns the set of matched
+   * charges (by identity). Pure w.r.t. the transactions (no mutation).
+   */
+  private computeDomesticHolds(
+    txns: Array<TransactionRow>,
+  ): Set<TransactionRow> {
+    const matched = new Set<TransactionRow>();
+
+    const holds = txns
+      .filter((t) => this.isFibiDomesticAuth(t))
+      .map((t) => ({
+        amountMinor: Math.abs(actualApi.utils.amountToInteger(t.chargedAmount)),
+        date: toJerusalemDate(t.date),
+      }));
+    if (holds.length === 0) return matched;
+
+    // Eligible: completed domestic (ILS) card charges. FX charges are excluded —
+    // their hold handling is the separate `fxOverrides` path (kept pending).
+    const eligible = txns.filter(
+      (tx) =>
+        this.isCardCharge(tx) &&
+        tx.status === TransactionStatuses.Completed &&
+        (!tx.originalCurrency || tx.originalCurrency === "ILS"),
+    );
+
+    interface Pair {
+      ci: number;
+      hi: number;
+      dist: number;
+    }
+    const pairs: Pair[] = [];
+    eligible.forEach((tx, ci) => {
+      const mag = Math.abs(actualApi.utils.amountToInteger(tx.chargedAmount));
+      const date = toJerusalemDate(tx.date);
+      holds.forEach((h, hi) => {
+        if (h.amountMinor !== mag) return;
+        const dist = Math.abs(daysAgo(h.date, date));
+        if (dist <= DOMESTIC_HOLD_WINDOW_DAYS) pairs.push({ ci, hi, dist });
+      });
+    });
+
+    const usedCharge = new Set<number>();
+    const usedHold = new Set<number>();
+    for (const p of pairs.sort((a, b) => a.dist - b.dist)) {
+      if (usedCharge.has(p.ci) || usedHold.has(p.hi)) continue;
+      usedCharge.add(p.ci);
+      usedHold.add(p.hi);
+      matched.add(eligible[p.ci]);
+    }
+
+    if (matched.size > 0) {
+      logger(
+        `fibi domestic holds: ${matched.size} card charge(s) matched a live FIBI auth-hold -> cleared`,
+      );
+    }
+    return matched;
+  }
+
+  /**
    * Build FX-anchor overrides (opt-in via `anchorFxToFibi`): pool the FIBI FX
    * auth amounts (they stay excluded — used only as an amount source), then for
    * each Isracard FX charge pick the best matching auth and record its ILS amount
@@ -507,22 +632,36 @@ export class ActualBudgetStorage implements TransactionStorage {
 
     const today = toJerusalemDate(new Date());
 
-    // The card-charge clearing date, and whether FIBI has actually posted it.
-    // Under `clearOnFibiSettlement` the authoritative signal is the enrichment
-    // MATCH (`tx.bankSettled`): a matched granular is in a POSTED FIBI settlement
-    // -> clear it on the FIBI charge date. An unmatched card charge is kept
-    // UNCLEARED on the purchase date until FIBI posts it — UNLESS it is already
-    // at least FIBI_SETTLE_LAG_DAYS old, in which case FIBI has certainly posted
-    // it (the drill-down just didn't confirm it) so we clear it on the purchase
-    // date. This supersedes clearOnChargeDate's charge-date<=today trigger for
-    // CARD charges.
+    // The card-charge clearing date under the unified `clearOnFibiSettlement` rule:
+    // a card charge is CLEARED iff it currently APPEARS ON FIBI — as a settlement
+    // OR an auth-hold — otherwise it stays UNCLEARED on the purchase date until it
+    // does. There is no per-card-type branch in the "appears on FIBI?" check; the
+    // three ways it can appear, in priority order:
+    //   1. `tx.bankSettled` — the enrichment matched it to a POSTED FIBI settlement
+    //      drill-down. Clear it on the real FIBI charge date (`processedDate`).
+    //   2. `fibiDomesticHolds` — FIBI is currently auth-HOLDING this domestic
+    //      charge (matched to a "דירקט אושר-ישראכרט" hold by |amount| + date). It
+    //      is on FIBI now; clear it. No FIBI charge date exists yet (still an auth,
+    //      not a settlement), so clear it on the purchase date.
+    //   3. NARROW 0041-only age fallback — a direct-debit (0041) charge posts to
+    //      FIBI within ~2-3 days; if both signals above missed it (drill-down out
+    //      of window AND the hold already released) and it is >= FIBI_SETTLE_LAG_DAYS
+    //      old, it has certainly posted. Gated to 0041 so a monthly-credit (5104)
+    //      charge is NEVER aged out ahead of its statement (the reported bug).
+    // Anything else stays uncleared. This supersedes clearOnChargeDate's
+    // charge-date<=today trigger for CARD charges.
     let cardChargeDate: string | undefined;
     let fibiSettlementPending = false;
     if (clearOnFibiSettlement && isCardChargeRow && !isPending) {
       if (tx.bankSettled) {
         cardChargeDate = toJerusalemDate(tx.processedDate ?? tx.date);
-      } else if (daysAgo(keyDate, today) >= FIBI_SETTLE_LAG_DAYS) {
-        cardChargeDate = keyDate; // time-lag fallback: cleared on the purchase date
+      } else if (this.fibiDomesticHolds.has(tx)) {
+        cardChargeDate = keyDate; // on FIBI as a live auth-hold: clear on purchase date
+      } else if (
+        this.isCard0041(tx) &&
+        daysAgo(keyDate, today) >= FIBI_SETTLE_LAG_DAYS
+      ) {
+        cardChargeDate = keyDate; // 0041-only settle fallback: cleared on the purchase date
       } else {
         fibiSettlementPending = true;
       }
@@ -564,6 +703,24 @@ export class ActualBudgetStorage implements TransactionStorage {
       fibiHolding ||
       fibiSettlementPending;
 
+    // A FIBI-direct NON-CARD row under clearOnFibiSettlement (a ביטוח לאומי /
+    // מופ"ת reserve credit, a salary, a standing-order bill...). It clears
+    // immediately ("appears on FIBI => cleared"), but its moneyman uniqueId is
+    // NOT stable pending->settled: FIBI first shows the credit value-dated
+    // ("*יזום", posts next business day) with no reference, then re-reports it
+    // settled with a late-assigned identifier and/or a re-stamped date. That
+    // changes hash(uniqueId), so its settledImportedId differs between the two
+    // views and the settled twin imports as a SECOND row (the recurring
+    // duplicate). These rows already carry a stable signature base key
+    // (pend:sig_ over |originalAmount|+currency+account); the fix is to ANCHOR
+    // their Actual identity to that key by routing them through the planner's
+    // base-key (pending) path — cleared, but collapsible pending<->settled — via
+    // the decoupled `cleared` flag. Card charges keep their own lifecycle; FX
+    // Isracard rows already anchor to the base key through their kept-pending
+    // twin, so both are untouched. General rule, not a merchant name-match.
+    const anchorToStableKey =
+      clearOnFibiSettlement && !isCardChargeRow && !effectivePending;
+
     // The Actual ROW date. A settled domestic card charge that has actually been
     // charged (charge date <= today) is dated on that real bank charge date so
     // cleared rows reconstruct FIBI's running balance; everything else (pending,
@@ -585,7 +742,10 @@ export class ActualBudgetStorage implements TransactionStorage {
     return {
       baseKey,
       settledImportedId: this.settledImportedId(tx),
-      isPending: effectivePending,
+      // Route the FIBI-direct non-card row through the base-key path so its
+      // pending and settled views collapse onto ONE row, but keep it cleared.
+      isPending: anchorToStableKey ? true : effectivePending,
+      cleared: anchorToStableKey,
       amount,
       date: rowDate,
       // Window-match a signature-keyed twin on the purchase/key date, which is
