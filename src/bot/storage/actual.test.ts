@@ -819,6 +819,84 @@ describe("ActualBudgetStorage clearOnFibiSettlement", () => {
     expect(rows[0].cleared).toBe(false); // no matching hold, recent, not aged -> uncleared
   });
 
+  it("(hold-pending) a PENDING 0041 charge FIBI is auth-HOLDING clears (the reported bug)", async () => {
+    // The reported bug: a recent 0041 purchase sits Pending on the Isracard side
+    // (not yet in a completed statement) while FIBI has already auth-held it as
+    // "דירקט אושר-ישראכרט". It appears on FIBI, so it must clear even while pending.
+    await save(
+      [
+        cardTx({ status: TransactionStatuses.Pending, uniqueId: "hp" }),
+        fibiHold({ uniqueId: "hp-hold" }),
+      ],
+      { ...cfg, excludeDescriptions: ["אושר-ישרא"] },
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1); // FIBI auth excluded, not imported
+    expect(rows[0].payee_name).toBe("Upapp");
+    expect(rows[0].cleared).toBe(true); // pending but on FIBI as a live hold -> cleared
+    expect(rows[0].date).toBe(toJerusalemDate(RECENT)); // purchase date
+    expect(rows[0].amount).toBe(-10000); // amount unchanged
+  });
+
+  it("(5104-pending) a PENDING 5104 charge with NO FIBI hold stays UNCLEARED", async () => {
+    // A monthly-credit (5104) charge is genuinely not on FIBI yet — no matching
+    // "דירקט אושר" hold — so it must stay uncleared (this is the ₪7.35 remainder).
+    await save(
+      [
+        cardTx({
+          status: TransactionStatuses.Pending,
+          account: "5104",
+          uniqueId: "mp",
+        }),
+      ],
+      {
+        ...cfg,
+        accounts: { "0041": "act-1", "5104": "act-1" },
+        excludeDescriptions: ["אושר-ישרא"],
+      },
+    );
+    const rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(false); // not on FIBI until its statement
+    expect(rows[0].date).toBe(toJerusalemDate(RECENT));
+  });
+
+  it("(hold-pending) pending+held -> later settled twin stays a SINGLE cleared row, category intact", async () => {
+    // Run 1: pending 0041 charge FIBI is holding -> cleared. uniqueId is the
+    // Isracard pending form (no voucher). Owner categorizes it.
+    await save(
+      [
+        cardTx({ status: TransactionStatuses.Pending, uniqueId: "tx-pending" }),
+        fibiHold({ uniqueId: "txh-hold" }),
+      ],
+      { ...cfg, excludeDescriptions: ["אושר-ישרא"] },
+    );
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    rows[0].category = "cat-y";
+
+    // Run 2: Isracard now reports it Completed with a DIFFERENT (voucher-based)
+    // uniqueId, and FIBI has posted the settlement (bankSettled, real charge date).
+    // Must collapse onto the same row via the card key: single row, still cleared.
+    await save(
+      [
+        cardTx({
+          status: TransactionStatuses.Completed,
+          bankSettled: true,
+          processedDate: CHARGE,
+          uniqueId: "tx-settled-voucher",
+        }),
+      ],
+      cfg,
+    );
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // no duplicate across the auth->settlement transition
+    expect(rows[0].cleared).toBe(true); // stays cleared
+    expect(rows[0].date).toBe(toJerusalemDate(CHARGE)); // finalized on the FIBI charge date
+    expect(rows[0].category).toBe("cat-y"); // owner category preserved
+  });
+
   it("(c) unmatched RECENT -> matched next run flips to cleared: single row, no dupe", async () => {
     await save([cardTx({ uniqueId: "c" })], cfg); // unmatched recent -> uncleared
     let rows = storeOf();

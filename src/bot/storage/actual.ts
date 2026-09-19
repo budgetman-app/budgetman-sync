@@ -476,12 +476,19 @@ export class ActualBudgetStorage implements TransactionStorage {
       }));
     if (holds.length === 0) return matched;
 
-    // Eligible: completed domestic (ILS) card charges. FX charges are excluded —
-    // their hold handling is the separate `fxOverrides` path (kept pending).
+    // Eligible: domestic (ILS) card charges, PENDING or Completed. A recent card
+    // purchase often sits Pending on the Isracard side (not yet in a completed
+    // statement) while FIBI has ALREADY auth-held it as "דירקט אושר-ישראכרט" —
+    // that charge appears on FIBI, so it must be matchable (and thereby clearable)
+    // even while still pending. Completed-only was the reported bug: three 0041
+    // 09-18 charges stayed uncleared despite live FIBI holds. FX charges are
+    // excluded — their hold handling is the separate `fxOverrides` path (kept
+    // pending). A FIBI domestic auth row is the hold SIGNAL, never a charge, so it
+    // is excluded here or it would consume its own hold.
     const eligible = txns.filter(
       (tx) =>
         this.isCardCharge(tx) &&
-        tx.status === TransactionStatuses.Completed &&
+        !this.isFibiDomesticAuth(tx) &&
         (!tx.originalCurrency || tx.originalCurrency === "ILS"),
     );
 
@@ -650,12 +657,20 @@ export class ActualBudgetStorage implements TransactionStorage {
     //      charge is NEVER aged out ahead of its statement (the reported bug).
     // Anything else stays uncleared. This supersedes clearOnChargeDate's
     // charge-date<=today trigger for CARD charges.
+    //
+    // This branch computes the SETTLED-path clear date (COMPLETED rows). A charge
+    // that is still PENDING on the Isracard side but already auth-held by FIBI is a
+    // separate case handled via `cardClearedWhilePending` below: it must clear too
+    // (it appears on FIBI — the reported bug: three 09-18 0041 charges sat Pending
+    // on Isracard while FIBI held them), but it is routed through the base-key
+    // (pending) path so its identity stays collapsible onto the later settled twin.
+    const heldByFibi = this.fibiDomesticHolds.has(tx);
     let cardChargeDate: string | undefined;
     let fibiSettlementPending = false;
     if (clearOnFibiSettlement && isCardChargeRow && !isPending) {
       if (tx.bankSettled) {
         cardChargeDate = toJerusalemDate(tx.processedDate ?? tx.date);
-      } else if (this.fibiDomesticHolds.has(tx)) {
+      } else if (heldByFibi) {
         cardChargeDate = keyDate; // on FIBI as a live auth-hold: clear on purchase date
       } else if (
         this.isCard0041(tx) &&
@@ -721,6 +736,19 @@ export class ActualBudgetStorage implements TransactionStorage {
     const anchorToStableKey =
       clearOnFibiSettlement && !isCardChargeRow && !effectivePending;
 
+    // A card charge still PENDING on the Isracard side but already auth-held by
+    // FIBI ("דירקט אושר-ישראכרט"): it appears on FIBI, so it must clear (the
+    // reported bug) — yet, unlike a settled charge, it must keep a COLLAPSIBLE
+    // identity so the later voucher-keyed settled twin (whose settledImportedId
+    // differs) merges onto this same row instead of duplicating. So route it
+    // through the base-key (pending) path exactly like `anchorToStableKey`, but
+    // marked cleared. A pending 5104 has no FIBI hold, so it is not held here and
+    // correctly stays uncleared until its monthly statement.
+    const cardClearedWhilePending =
+      clearOnFibiSettlement && isCardChargeRow && isPending && heldByFibi;
+    const routeThroughBaseKeyCleared =
+      anchorToStableKey || cardClearedWhilePending;
+
     // The Actual ROW date. A settled domestic card charge that has actually been
     // charged (charge date <= today) is dated on that real bank charge date so
     // cleared rows reconstruct FIBI's running balance; everything else (pending,
@@ -742,10 +770,11 @@ export class ActualBudgetStorage implements TransactionStorage {
     return {
       baseKey,
       settledImportedId: this.settledImportedId(tx),
-      // Route the FIBI-direct non-card row through the base-key path so its
-      // pending and settled views collapse onto ONE row, but keep it cleared.
-      isPending: anchorToStableKey ? true : effectivePending,
-      cleared: anchorToStableKey,
+      // Route the FIBI-direct non-card row (anchorToStableKey) OR a FIBI-held
+      // pending card charge (cardClearedWhilePending) through the base-key path so
+      // its pending and settled views collapse onto ONE row, but keep it cleared.
+      isPending: routeThroughBaseKeyCleared ? true : effectivePending,
+      cleared: routeThroughBaseKeyCleared,
       amount,
       date: rowDate,
       // Window-match a signature-keyed twin on the purchase/key date, which is

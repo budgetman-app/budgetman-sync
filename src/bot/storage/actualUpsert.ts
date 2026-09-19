@@ -338,12 +338,16 @@ export function planActualUpsert(
             `pending re-dated: ${tx.payeeName} ${twin.date}→${matchDate}`,
           );
         }
-        // Keep a base-key-anchored row at its desired cleared state (a FIBI-direct
-        // non-card credit is imported cleared but routed here for stable identity).
-        // For genuine card/FX pending rows tx.cleared is false and so is the twin,
-        // so this never fires — their behavior is unchanged.
-        if (Boolean(tx.cleared) !== twin.cleared) {
-          fields.cleared = Boolean(tx.cleared);
+        // Upgrade a base-key-anchored row to cleared when it now appears on FIBI (a
+        // FIBI-direct non-card credit imported cleared but routed here for stable
+        // identity; or a FIBI-held pending card charge). NEVER downgrade cleared ->
+        // uncleared: once a row appears on FIBI it stays posted, so a later run that
+        // reports it pending-and-no-longer-held (e.g. the auth-hold released a beat
+        // before the Isracard settlement lands) must not un-clear it. For genuine
+        // card/FX pending rows tx.cleared is false and so is the twin, so this never
+        // fires — their behavior is unchanged.
+        if (Boolean(tx.cleared) && !twin.cleared) {
+          fields.cleared = true;
         }
         if (Object.keys(fields).length > 0) {
           updates.push({ id: twin.id, fields });
