@@ -68,17 +68,33 @@ export function merchantsMatch(a: string, b: string): boolean {
   return a.startsWith(b) || b.startsWith(a);
 }
 
-/** FX-stable identity of a charge for approval<->completed de-dup: |originalAmount|
- * (minor units) + originalCurrency + normalized merchant + Asia/Jerusalem purchase
- * date. Same-source (Isracard vs Isracard), so merchant uses exact normalized
- * equality, not the prefix tolerance used cross-source. */
-function chargeSignature(tx: Transaction): string {
-  return [
-    amountKeyMinor(tx.originalAmount),
-    tx.originalCurrency ?? "",
-    normalizeMerchant(tx.description),
-    toJerusalemDate(tx.date),
-  ].join("|");
+/**
+ * Are two Isracard rows the SAME real charge, for pending<->pending and
+ * pending<->completed de-dup? FX-stable identity: equal |originalAmount| (minor
+ * units) + originalCurrency + Asia/Jerusalem purchase date, PLUS a
+ * prefix-tolerant merchant match.
+ *
+ * The merchant is prefix-tolerant (not exact) because Isracard reports the SAME
+ * charge with DIFFERENT merchant strings across its feeds — the pending web-app
+ * truncates or suffixes it differently from the settled scrape (live: the same
+ * purchase appears as "שופרסל דיל גולדה חולון" vs "שופרסל דיל גולדה חול", and
+ * "בורגרסבר חולון" vs "בורגרסבר חולון-גמא"). Exact-merchant matching missed these,
+ * so both representations survived de-dup, took the same `pend:sig_` storage key,
+ * and the second was minted as a `#1` duplicate. `merchantsMatch` (shared with the
+ * cross-source charge-date matcher) needs the shorter name to be >= 6 chars, so a
+ * genuinely different merchant with the same amount+date (e.g. two "ארומה"
+ * branches) is NOT collapsed.
+ */
+export function isSameCardCharge(a: Transaction, b: Transaction): boolean {
+  return (
+    amountKeyMinor(a.originalAmount) === amountKeyMinor(b.originalAmount) &&
+    (a.originalCurrency ?? "") === (b.originalCurrency ?? "") &&
+    toJerusalemDate(a.date) === toJerusalemDate(b.date) &&
+    merchantsMatch(
+      normalizeMerchant(a.description),
+      normalizeMerchant(b.description),
+    )
+  );
 }
 
 /**
@@ -89,12 +105,14 @@ function chargeSignature(tx: Transaction): string {
  * `findTwin` (which ignores same-batch adds) can't collapse them (the live
  * ארומה −17 double). The approval is the stale copy; keep the completed one.
  *
- * Match by `chargeSignature`. CONSUME-ONCE by count: remove at most as many
- * approvals as there are matching completed twins, so N genuinely-distinct
- * same-signature charges (which appear together in ONE bucket) are untouched, and
- * a real still-pending charge alongside a captured twin survives. Order-preserving.
- * Correct in general (a captured charge shouldn't also show as pending),
- * independent of any flag.
+ * Match by {@link isSameCardCharge} (amount + currency + date + prefix-tolerant
+ * merchant). CONSUME-ONCE: remove at most as many approvals as there are matching
+ * completed twins, so N genuinely-distinct same-signature charges (which appear
+ * together in ONE bucket) are untouched, and a real still-pending charge alongside
+ * a captured twin survives. Order-preserving. Correct in general (a captured
+ * charge shouldn't also show as pending), independent of any flag. The merchant
+ * tolerance is what lets a lingering pending drop against its settled twin even
+ * when Isracard reformatted the merchant string on settlement.
  */
 export function dedupeApprovalsAgainstCompleted(
   approvals: Transaction[],
@@ -102,21 +120,41 @@ export function dedupeApprovalsAgainstCompleted(
 ): Transaction[] {
   if (approvals.length === 0 || completed.length === 0) return approvals;
 
-  const completedTwins = new Map<string, number>();
-  for (const c of completed) {
-    if (c.status !== TransactionStatuses.Completed) continue;
-    const k = chargeSignature(c);
-    completedTwins.set(k, (completedTwins.get(k) ?? 0) + 1);
-  }
+  const twins = completed.filter(
+    (c) => c.status === TransactionStatuses.Completed,
+  );
+  const consumed = new Set<number>();
 
   const kept: Transaction[] = [];
   for (const a of approvals) {
-    const k = chargeSignature(a);
-    const remaining = completedTwins.get(k) ?? 0;
-    if (remaining > 0) {
-      completedTwins.set(k, remaining - 1); // consume one twin, drop this approval
+    const idx = twins.findIndex(
+      (c, i) => !consumed.has(i) && isSameCardCharge(a, c),
+    );
+    if (idx !== -1) {
+      consumed.add(idx); // consume one twin, drop this approval
       continue;
     }
+    kept.push(a);
+  }
+  return kept;
+}
+
+/**
+ * Collapse duplicate PENDING approvals of the SAME charge that Isracard's web-app
+ * returns more than once with a REFORMATTED merchant string within one scrape (the
+ * live שופרסל/בורגרסבר `#1` duplicate: "…חולון" and "…חול" both came back pending,
+ * differing only in truncation, so {@link groupApprovals}' exact-`businessName`
+ * de-dup kept both; they then shared one `pend:sig_` key and the second was minted
+ * as a `#1` twin in Actual). Keeps the first of each same-charge group
+ * ({@link isSameCardCharge}), consume-once. Safe: `groupApprovals` has already
+ * dropped byte-identical approvals, so any survivor pair here differs in merchant
+ * text — i.e. is a reformat artifact, not two genuine identical purchases (those
+ * arrive as distinct settled vouchers, not two pending rows).
+ */
+export function dedupeApprovals(approvals: Transaction[]): Transaction[] {
+  const kept: Transaction[] = [];
+  for (const a of approvals) {
+    if (kept.some((k) => isSameCardCharge(a, k))) continue;
     kept.push(a);
   }
   return kept;

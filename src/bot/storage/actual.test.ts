@@ -897,6 +897,49 @@ describe("ActualBudgetStorage clearOnFibiSettlement", () => {
     expect(rows[0].category).toBe("cat-y"); // owner category preserved
   });
 
+  it("(settle-collapse) settled twin with a REFORMATTED merchant collapses onto the cleared-while-pending row (no #1)", async () => {
+    // Reproduces the reported #1 regression's end-state: at settlement Isracard
+    // reports a truncated/suffixed merchant. The sig key ignores description, so the
+    // settled capture must collapse onto the existing cleared-while-pending row —
+    // NOT mint a `pend:sig_…#1` slot. (The duplicate pending INPUT that actually
+    // produced the #1 is removed upstream by the scraper's dedupeApprovals /
+    // dedupeApprovalsAgainstCompleted; here storage sees the single settled twin.)
+    await save(
+      [
+        cardTx({
+          status: TransactionStatuses.Pending,
+          uniqueId: "rf-pending",
+          description: "שופרסל דיל גולדה חולון",
+        }),
+        fibiHold({ uniqueId: "rf-hold" }),
+      ],
+      { ...cfg, excludeDescriptions: ["אושר-ישרא"] },
+    );
+    let rows = storeOf();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].cleared).toBe(true);
+    expect(String(rows[0].imported_id).includes("#")).toBe(false);
+    rows[0].category = "cat-rf";
+
+    await save(
+      [
+        cardTx({
+          status: TransactionStatuses.Completed,
+          bankSettled: true,
+          processedDate: CHARGE,
+          uniqueId: "rf-voucher",
+          description: "שופרסל דיל גולדה חול", // reformatted (truncated) on settlement
+        }),
+      ],
+      cfg,
+    );
+    rows = storeOf();
+    expect(rows).toHaveLength(1); // no #1 duplicate
+    expect(rows.some((r) => String(r.imported_id).includes("#"))).toBe(false);
+    expect(rows[0].cleared).toBe(true);
+    expect(rows[0].category).toBe("cat-rf"); // owner category preserved
+  });
+
   it("(c) unmatched RECENT -> matched next run flips to cleared: single row, no dupe", async () => {
     await save([cardTx({ uniqueId: "c" })], cfg); // unmatched recent -> uncleared
     let rows = storeOf();

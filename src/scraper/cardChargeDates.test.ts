@@ -1,5 +1,7 @@
 import {
+  dedupeApprovals,
   dedupeApprovalsAgainstCompleted,
+  isSameCardCharge,
   matchChargeDatesToGranular,
   matchFxResidualsToGranular,
   merchantsMatch,
@@ -175,6 +177,103 @@ describe("dedupeApprovalsAgainstCompleted", () => {
       [approval() /* pending, not a twin */, completed()],
     );
     expect(kept.map((k) => k.description)).toEqual(["ראשון"]);
+  });
+
+  it("(reformat) drops a pending whose SETTLED twin has a truncated/suffixed merchant", () => {
+    // The regression: at settlement Isracard reformats the merchant, so exact
+    // matching missed the twin and both survived -> `#1` dup. Prefix-tolerant now.
+    const shufersalPending = approval({
+      description: "שופרסל דיל גולדה חולון",
+      originalAmount: -91.16,
+      chargedAmount: -91.16,
+    });
+    const shufersalSettled = completed({
+      description: "שופרסל דיל גולדה חול", // truncated on settlement
+      originalAmount: -91.16,
+      chargedAmount: -91.16,
+    });
+    expect(
+      dedupeApprovalsAgainstCompleted([shufersalPending], [shufersalSettled]),
+    ).toHaveLength(0);
+
+    const burgerPending = approval({
+      description: "בורגרסבר חולון",
+      originalAmount: -50,
+      chargedAmount: -50,
+    });
+    const burgerSettled = completed({
+      description: "בורגרסבר חולון-גמא", // suffixed on settlement
+      originalAmount: -50,
+      chargedAmount: -50,
+    });
+    expect(
+      dedupeApprovalsAgainstCompleted([burgerPending], [burgerSettled]),
+    ).toHaveLength(0);
+  });
+});
+
+describe("dedupeApprovals (pending<->pending reformat de-dup)", () => {
+  const approval = (over: Partial<Transaction> = {}): Transaction => ({
+    type: TransactionTypes.Normal,
+    identifier: undefined,
+    date: "2026-09-18T00:00:00.000Z",
+    processedDate: "2026-09-18T00:00:00.000Z",
+    originalAmount: -91.16,
+    originalCurrency: "ILS",
+    chargedAmount: -91.16,
+    chargedCurrency: "ILS",
+    description: "שופרסל דיל גולדה חולון",
+    status: TransactionStatuses.Pending,
+    memo: "",
+    ...over,
+  });
+
+  it("collapses two pending views of the same charge that differ only by merchant reformat", () => {
+    const kept = dedupeApprovals([
+      approval(),
+      approval({ description: "שופרסל דיל גולדה חול" }), // truncated twin
+    ]);
+    expect(kept).toHaveLength(1);
+    expect(kept[0].description).toBe("שופרסל דיל גולדה חולון"); // keeps the first
+  });
+
+  it("keeps genuinely different merchants with the same amount + date", () => {
+    const kept = dedupeApprovals([
+      approval({ description: "שופרסל דיל גולדה חולון" }),
+      approval({ description: "רמי לוי חולון" }), // different merchant, no prefix match
+    ]);
+    expect(kept).toHaveLength(2);
+  });
+
+  it("keeps charges with the same merchant but different amount or date", () => {
+    expect(
+      dedupeApprovals([
+        approval(),
+        approval({ originalAmount: -50, chargedAmount: -50 }),
+      ]),
+    ).toHaveLength(2);
+    expect(
+      dedupeApprovals([
+        approval(),
+        approval({ date: "2026-09-11T00:00:00.000Z" }),
+      ]),
+    ).toHaveLength(2);
+  });
+
+  it("isSameCardCharge: prefix-tolerant merchant, exact amount+currency+date", () => {
+    const a = approval();
+    expect(
+      isSameCardCharge(a, approval({ description: "שופרסל דיל גולדה חול" })),
+    ).toBe(true);
+    expect(
+      isSameCardCharge(a, approval({ description: "רמי לוי חולון" })),
+    ).toBe(false);
+    expect(
+      isSameCardCharge(
+        a,
+        approval({ originalAmount: -92, chargedAmount: -92 }),
+      ),
+    ).toBe(false);
   });
 });
 
